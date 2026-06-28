@@ -32,9 +32,10 @@ from typing import Callable, Tuple
 from flask import Flask, jsonify, request
 
 from aligner import AlignmentError, align
+from logctx import bind_request, configure_logging
 from transcriber import TranscriptionError, transcribe
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -67,6 +68,7 @@ def healthz():
 
 @app.post("/align")
 def align_endpoint():
+    bind_request("/align")
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return _error("invalid_request", "需要 JSON body", 400)
@@ -135,6 +137,7 @@ def transcribe_endpoint():
     與 ``/align`` 的差別:**不需 ``lines``**(無既有文字)。``language`` 選填,
     省略則自動偵測。音訊來源同 ``/align``(``audio.gcs`` 或 ``audio.inlineBase64``)。
     """
+    bind_request("/transcribe")
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return _error("invalid_request", "需要 JSON body", 400)
