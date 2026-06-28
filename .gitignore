@@ -11,6 +11,10 @@ firebase-debug.*.log
 
 # Secrets — 視需要決定是否納管
 *.local
+# Service account 金鑰，切勿提交（repo 為 public）
+*-firebase-adminsdk-*.json
+*-sa.json
+gcp-*.json
 
 # macOS
 .DS_Store
