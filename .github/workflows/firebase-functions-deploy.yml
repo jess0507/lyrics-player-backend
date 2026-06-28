@@ -1,0 +1,49 @@
+name: Deploy Cloud Functions
+
+# 當 master 上的 functions/、Firestore rules 或 Firebase 設定變更時，
+# 部署 Cloud Functions 與 Firestore security rules。
+# 也可在 Actions 頁手動觸發（workflow_dispatch）。
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "functions/**"
+      - "firestore.rules"
+      - "firebase.json"
+      - ".firebaserc"
+      - ".github/workflows/firebase-functions-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy functions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python 版本須與 firebase.json 的 "runtime": "python312" 一致。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # firebase CLI 部署前會用本地 venv 載入 main.py 探測函式，必須先建好。
+      - name: Build functions venv
+        run: |
+          cd functions
+          python -m venv venv
+          venv/bin/pip install -r requirements.txt
+
+      # 憑證沿用 hosting 的 service account secret；若權限不足見
+      # tasks/account-deletion-cloud-functions.md 的「權限注意」。
+      - name: Deploy to Firebase
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SEEK_PLAYER_F724E }}
+        run: |
+          echo "$FIREBASE_SA" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+          npx firebase-tools deploy --only functions,firestore:rules --project seek-player-f724e --non-interactive
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json"

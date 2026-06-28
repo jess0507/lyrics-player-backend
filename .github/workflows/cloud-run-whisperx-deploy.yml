@@ -1,0 +1,49 @@
+name: Deploy whisperx align (Cloud Run)
+
+# 當 master 上的 whisperx_service/(歌詞自動對時容器,aeneas 路線的升級選項)變更
+# 時,以 Cloud Build 從原始碼建置並部署到 Cloud Run。也可手動觸發
+# (workflow_dispatch)。
+#
+# 與 aeneas 路線(cloud-run-aeneas-deploy.yml)/ functions 的 Firebase Functions
+# 部署互相獨立:兩個對齊容器可並存,由 align_lyrics 的 ALIGN_SERVICE_URL 決定當前
+# 採用哪條路線(見 whisperx_service/README.md「如何切換」)。
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "whisperx_service/**"
+      - ".github/workflows/cloud-run-whisperx-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy whisperx-align
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 沿用 aeneas 路線的部署 SA(具 Cloud Run / Cloud Build / Artifact Registry /
+      # Storage 部署權限)。
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_RUN_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # --source 讓 Cloud Build 用 whisperx_service/Dockerfile 建置;
+      # 記憶體 / CPU 高於 aeneas(wav2vec2 較重),CPU 推論、無需 GPU。
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy whisperx-align \
+            --source whisperx_service \
+            --project seek-player-f724e \
+            --region asia-east1 \
+            --memory 8Gi \
+            --cpu 4 \
+            --concurrency 1 \
+            --timeout 600 \
+            --no-allow-unauthenticated \
+            --quiet

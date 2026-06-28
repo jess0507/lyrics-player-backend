@@ -1,0 +1,16 @@
+rules_version = '2';
+
+// 使用者資料（users/{uid}：設定 + 統計快照）僅限本人讀寫;
+// 其餘路徑一律拒絕。Cloud Functions 走 Admin SDK 不受此規則限制。
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+
+      // 子集合（若日後 tracks 改為 subcollection）一併限定本人。
+      match /{document=**} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+  }
+}

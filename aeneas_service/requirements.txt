@@ -1,0 +1,9 @@
+# aeneas 為 2017 年最後釋出的舊套件,對 Python 版本與 numpy 敏感。
+# Docker 映像以 Python 3.8 + numpy 1.23.x 建置(見 Dockerfile),
+# 並在安裝 aeneas 前先裝好 numpy(aeneas 的 setup 會 import numpy)。
+flask==3.0.3
+gunicorn==21.2.0
+google-cloud-storage==2.14.0
+lxml==4.9.4
+numpy==1.23.5
+aeneas==1.7.3.0

@@ -1,0 +1,14 @@
+# WhisperX forced-alignment 服務依賴。
+#
+# torch / torchaudio 以 CPU wheel 安裝(見 Dockerfile 的 --extra-index-url)。
+# whisperx 會連帶拉入 transformers / faster-whisper / pyannote 等(本服務只用其
+# 對齊部分,故映像偏大——屬已知風險,見 plans/13)。版本對 torch 敏感,勿隨意升級。
+flask==3.0.3
+gunicorn==21.2.0
+google-cloud-storage==2.14.0
+# pyannote.audio(whisperx 連帶)仍用 np.NaN,NumPy 2.0 已移除 → import 時崩潰。
+# 釘在 1.x 以相容;torch 2.2.2 亦相容 numpy<2。
+numpy<2.0
+torch==2.2.2
+torchaudio==2.2.2
+whisperx==3.1.5

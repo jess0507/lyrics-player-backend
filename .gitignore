@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Firebase / Cloud
+firebase-debug.log
+firebase-debug.*.log
+.firebase/
+
+# Secrets — 視需要決定是否納管
+*.local
+
+# macOS
+.DS_Store

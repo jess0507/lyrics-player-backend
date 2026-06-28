@@ -1,0 +1,48 @@
+name: Deploy aeneas align (Cloud Run)
+
+# 當 master 上的 aeneas_service/(歌詞自動對時容器)變更時,
+# 以 Cloud Build 從原始碼建置並部署到 Cloud Run。
+# 也可在 Actions 頁手動觸發(workflow_dispatch)。
+#
+# 與 functions/ 的 Firebase Functions 部署互相獨立(見
+# firebase-functions-deploy.yml);aeneas 需 espeak/ffmpeg 系統依賴,走自架容器。
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "aeneas_service/**"
+      - ".github/workflows/cloud-run-aeneas-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy aeneas-align
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 認證用的 service account 需具備 Cloud Run / Cloud Build / Artifact
+      # Registry / Storage(讀部署用 GCS)等部署權限。可沿用既有
+      # FIREBASE_SERVICE_ACCOUNT_* secret 並補授權,或另設一組部署專用 SA。
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_RUN_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # --source 讓 Cloud Build 用 aeneas_service/Dockerfile 建置;
+      # 記憶體 / CPU / 逾時對齊 README 的部署建議。
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy aeneas-align \
+            --source aeneas_service \
+            --project seek-player-f724e \
+            --region asia-east1 \
+            --memory 2Gi \
+            --cpu 2 \
+            --timeout 600 \
+            --no-allow-unauthenticated \
+            --quiet

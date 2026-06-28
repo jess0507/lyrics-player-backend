@@ -1,0 +1,6 @@
+firebase-functions>=0.4.2
+firebase-admin>=6.5.0
+
+# align_lyrics:取 Cloud Run ID token + 轉呼 /align。
+google-auth>=2.28.0
+requests>=2.31.0
