@@ -9,7 +9,14 @@
 
 import unittest
 
-from aligner import build_fragments, normalize_language, separator_for
+from aligner import (
+    _chunk_bounds,
+    build_fragments,
+    frame_spans,
+    normalize_language,
+    separator_for,
+    tokenize_text,
+)
 
 
 def _char(ch, start=None, end=None):
@@ -104,6 +111,67 @@ class BuildFragmentsTest(unittest.TestCase):
         # 全行無時間 → carry forward 為 0,covered 0(上層據覆蓋率判失敗)。
         self.assertEqual(timed, 0)
         self.assertEqual(frags[0]["begin"], 0.0)
+
+
+class TokenizeTextTest(unittest.TestCase):
+    # 仿 whisperx 字典:blank(<pad>)=0、詞界 "|"=1、小寫字母。
+    DICT = {"<pad>": 0, "|": 1, "a": 2, "b": 3, "c": 4}
+
+    def test_maps_known_chars_and_records_positions(self):
+        tokens, idx = tokenize_text("ab!c", self.DICT, 0)
+        self.assertEqual(tokens, [2, 3, 4])
+        self.assertEqual(idx, [0, 1, 3])  # "!" 不在字典 → 略過但不佔位
+
+    def test_space_maps_to_word_delimiter(self):
+        tokens, idx = tokenize_text("a b", self.DICT, 0)
+        self.assertEqual(tokens, [2, 1, 3])
+        self.assertEqual(idx, [0, 1, 2])
+
+    def test_uppercase_matches_lowercased_dictionary(self):
+        tokens, _ = tokenize_text("AB", self.DICT, 0)
+        self.assertEqual(tokens, [2, 3])
+
+    def test_blank_token_never_emitted(self):
+        # 字典若把某字元映到 blank id,不得混入目標序列。
+        tokens, _ = tokenize_text("a-b", {**self.DICT, "-": 0}, 0)
+        self.assertEqual(tokens, [2, 3])
+
+
+class FrameSpansTest(unittest.TestCase):
+    def test_merges_consecutive_and_skips_blank(self):
+        # 路徑:a a - b - - c c(blank=0)
+        spans = frame_spans([2, 2, 0, 3, 0, 0, 4, 4], 0)
+        self.assertEqual(spans, [(0, 1), (3, 3), (6, 7)])
+
+    def test_repeated_token_separated_by_blank(self):
+        # 相同 token 連續出現兩次 → CTC 路徑以 blank 相隔 → 兩個區間。
+        spans = frame_spans([2, 0, 2], 0)
+        self.assertEqual(spans, [(0, 0), (2, 2)])
+
+    def test_adjacent_different_tokens_without_blank(self):
+        spans = frame_spans([2, 3], 0)
+        self.assertEqual(spans, [(0, 0), (1, 1)])
+
+    def test_trailing_span_closed(self):
+        spans = frame_spans([0, 2, 2], 0)
+        self.assertEqual(spans, [(1, 2)])
+
+
+class ChunkBoundsTest(unittest.TestCase):
+    # 視窗 16000 樣本 = 1 秒;尾塊 < 1 秒(_SAMPLE_RATE)時併入前一塊。
+    def test_exact_multiple(self):
+        self.assertEqual(_chunk_bounds(32000, 16000), [0, 16000, 32000])
+
+    def test_short_tail_merged_into_previous(self):
+        self.assertEqual(_chunk_bounds(33000, 16000), [0, 16000, 33000])
+
+    def test_long_tail_kept(self):
+        self.assertEqual(
+            _chunk_bounds(65000, 16000), [0, 16000, 32000, 48000, 65000]
+        )
+
+    def test_single_short_chunk(self):
+        self.assertEqual(_chunk_bounds(8000, 16000), [0, 8000])
 
 
 if __name__ == "__main__":
