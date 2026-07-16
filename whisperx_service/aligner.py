@@ -105,6 +105,58 @@ def normalize_language(code: str) -> str:
     return key.split("-")[0][:2] or "en"
 
 
+# 以拉丁字母書寫、且 whisperx 有預設對齊模型的語言:歌詞為拉丁字母時,
+# client 的語言提示落在此集合才可信;否則(如 zh-TW 介面配英文歌)改用 en。
+_LATIN_SCRIPT_LANGS = {
+    "en", "fr", "de", "es", "it", "pt", "nl", "cs", "pl", "hu",
+    "fi", "tr", "da", "vi", "ca", "ro", "uz",
+}
+
+
+def _classify_char(ch: str) -> Optional[str]:
+    """字元 → 文字系統類別(hangul / kana / han / latin);非字母回 None。"""
+    o = ord(ch)
+    if 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F:
+        return "hangul"
+    if 0x3040 <= o <= 0x30FF or 0x31F0 <= o <= 0x31FF:
+        return "kana"
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:
+        return "han"
+    if ch.isalpha() and (o < 0x0250):  # 基本 + 擴充拉丁
+        return "latin"
+    return None
+
+
+def detect_language(lines: List[str], hint: str) -> str:
+    """由歌詞的文字系統推定對齊語言;client 提示僅在不衝突時採用。
+
+    App 送來的 ``language`` 是 **UI locale**,與歌曲語言經常不一致(例:zh-TW
+    介面對韓文歌)。對齊模型的字典必須涵蓋歌詞的文字系統,否則字元全數 OOV、
+    時間戳全空,故以歌詞字元為準:
+    - 諺文佔比高 → ko;假名出現 → ja(先於漢字判定,日文歌詞漢字假名混寫);
+      漢字佔比高 → zh;拉丁字母為主 → 提示屬拉丁語系則沿用提示,否則 en。
+    - 無法判定(純標點 / 數字等)→ 用正規化後的提示。
+    """
+    normalized_hint = normalize_language(hint)
+    counts = {"hangul": 0, "kana": 0, "han": 0, "latin": 0}
+    for ch in "".join(lines):
+        kind = _classify_char(ch)
+        if kind is not None:
+            counts[kind] += 1
+    letters = sum(counts.values())
+    if letters == 0:
+        return normalized_hint
+    if counts["hangul"] / letters >= 0.3:
+        return "ko"
+    if counts["kana"] / letters >= 0.1:
+        return "ja"
+    if counts["han"] / letters >= 0.3:
+        return "zh"
+    if counts["latin"] / letters >= 0.5:
+        return normalized_hint if normalized_hint in _LATIN_SCRIPT_LANGS else "en"
+    return normalized_hint
+
+
 def separator_for(language: str) -> str:
     """串接歌詞行時各行之間的分隔字元(中 / 日無空格,其餘用單一空格)。"""
     return "" if language in _LANGUAGES_WITHOUT_SPACES else " "
@@ -395,7 +447,10 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
         raise AlignmentError("音訊檔不存在或為空")
 
-    lang = normalize_language(language)
+    lang = detect_language(clean, language)
+    normalized_hint = normalize_language(language)
+    if lang != normalized_hint:
+        log.info("語言提示 %s 與歌詞文字系統不符,改用 %s", normalized_hint, lang)
     import whisperx  # 延後 import。
 
     audio = whisperx.load_audio(audio_path)

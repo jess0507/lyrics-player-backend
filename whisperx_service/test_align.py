@@ -12,6 +12,7 @@ import unittest
 from aligner import (
     _chunk_bounds,
     build_fragments,
+    detect_language,
     frame_spans,
     normalize_language,
     separator_for,
@@ -43,6 +44,40 @@ class NormalizeLanguageTest(unittest.TestCase):
         self.assertEqual(separator_for("zh"), "")
         self.assertEqual(separator_for("ja"), "")
         self.assertEqual(separator_for("en"), " ")
+
+
+class DetectLanguageTest(unittest.TestCase):
+    """App 送的 language 是 UI locale,常與歌曲語言不符;以歌詞文字系統為準。"""
+
+    def test_korean_lyrics_override_chinese_hint(self):
+        self.assertEqual(
+            detect_language(["사랑해요", "그대와 함께"], "zh-TW"), "ko"
+        )
+
+    def test_english_lyrics_with_chinese_hint_fall_back_to_en(self):
+        self.assertEqual(
+            detect_language(["Hello world", "I love you so"], "zh-TW"), "en"
+        )
+
+    def test_latin_lyrics_keep_latin_hint(self):
+        self.assertEqual(detect_language(["Te quiero mucho"], "es"), "es")
+        self.assertEqual(detect_language(["Je t'aime"], "fr-FR"), "fr")
+
+    def test_chinese_lyrics_override_english_hint(self):
+        self.assertEqual(detect_language(["我愛你", "月亮代表我的心"], "eng"), "zh")
+
+    def test_japanese_kana_beats_han(self):
+        # 日文歌詞漢字假名混寫:假名存在即應判 ja,而非 zh。
+        self.assertEqual(detect_language(["君の名前を呼ぶよ", "愛してる"], "zh-TW"), "ja")
+
+    def test_mixed_chinese_with_some_latin_stays_zh(self):
+        self.assertEqual(
+            detect_language(["我愛你 baby", "永遠不分離"], "zh-TW"), "zh"
+        )
+
+    def test_no_letters_uses_hint(self):
+        self.assertEqual(detect_language(["123", "...", "!!"], "ja"), "ja")
+        self.assertEqual(detect_language([], ""), "en")
 
 
 class BuildFragmentsTest(unittest.TestCase):
