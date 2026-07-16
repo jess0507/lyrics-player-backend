@@ -31,7 +31,7 @@ from typing import Callable, Tuple
 
 from flask import Flask, jsonify, request
 
-from aligner import AlignmentError, align
+from aligner import AlignmentError, ModelLoadError, align
 from logctx import bind_request, configure_logging
 from transcriber import TranscriptionError, transcribe
 
@@ -109,6 +109,14 @@ def align_endpoint():
 
     try:
         result = align([str(x) for x in lines], audio_path, language)
+    except ModelLoadError as exc:
+        # 模型載入失敗(HF 逾時等)是暫時性基礎設施問題:回 503,
+        # functions 端映成 UNAVAILABLE → app 顯示連線錯誤(可重試),
+        # 而非 422 alignment_failed(誤導使用者以為歌詞不匹配)。
+        log.warning(
+            "對齊模型載入失敗(503,已耗時 %.1fs):%s", time.perf_counter() - t0, exc
+        )
+        return _error("align_model_unavailable", str(exc), 503)
     except AlignmentError as exc:
         log.warning("對齊失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
         return _error("alignment_failed", str(exc), 422)

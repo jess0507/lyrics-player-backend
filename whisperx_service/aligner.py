@@ -48,6 +48,12 @@ class AlignmentError(Exception):
     """對齊失敗(輸入不合法,或 wav2vec2 無法產出可用結果)。"""
 
 
+class ModelLoadError(Exception):
+    """對齊模型載入失敗(HuggingFace 逾時 / 該語言無模型)。屬基礎設施問題,
+    非歌詞與音訊不匹配;endpoint 應回 503 讓 client 顯示連線錯誤並重試,
+    而非 422 alignment_failed(會誤導使用者以為歌詞有問題)。"""
+
+
 # whisperx 的對齊模型以**二字母**語言碼索引(load_align_model 的 language_code)。
 # 客戶端可能送 BCP-47 / ISO 639-3(沿用 aeneas 路線的預設 "eng"),這裡做寬鬆對應。
 _LANGUAGE_MAP = {
@@ -367,7 +373,7 @@ def _load_align_model(language: str):
             language_code=language, device="cpu"
         )
     except Exception as exc:  # 該語言無對齊模型 / 下載失敗
-        raise AlignmentError(f"無對齊模型可用({language}):{exc}") from exc
+        raise ModelLoadError(f"無對齊模型可用({language}):{exc}") from exc
     _ALIGN_MODEL_CACHE[language] = (model, metadata)
     return model, metadata
 

@@ -12,7 +12,8 @@ FROM python:3.11-slim-bookworm
 # - pkg-config + libav*-dev:whisperx 連帶的 PyAV(av)在無對應預編譯 wheel 時需
 #   從原始碼對系統 ffmpeg 編譯,缺這些會在 build wheel 階段報「pkg-config is
 #   required for building PyAV」。
-# 模型權重在執行期由 HuggingFace 下載,故 HF 快取目錄需可寫。
+# 模型權重於 build 時預烤進 image(見下方各 RUN);未預烤的語言在執行期
+# 由 HuggingFace 下載,故 HF 快取目錄仍需可寫。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         git \
@@ -61,6 +62,22 @@ print('VAD cached:', fp, len(r.content), 'bytes, sha256 OK')"
 # not match」422。build 時抓好放進 image,runtime 不下載、無 race(亦大幅縮短冷啟動)。
 # 模型大小 / 量化須與 transcriber.py 的 WHISPER_MODEL_SIZE / WHISPER_COMPUTE_TYPE 一致。
 RUN python -c "import whisperx; whisperx.load_model('small', device='cpu', compute_type='int8'); print('ASR model cached')"
+
+# 預烤 wav2vec2 對齊模型(/align 用):否則每個冷啟 instance 都在請求當下
+# 從 HuggingFace 下載(zh 約 1.2GB),HF 逾時即 422(2026-07-16 三例:HEAD
+# preprocessor_config.json read timeout ×5 重試後 cache miss 失敗)。預烤後
+# runtime 直接命中快取;即使 HF 暫時不可達,huggingface_hub 的 etag HEAD
+# 檢查失敗也會回退用快取,不再整批失敗。
+# - zh/ja(jonatasgrosman/wav2vec2-large-xlsr-53-*)、ko(kresnik/…-korean):
+#   HF 模型,各 ~1.26GB → $HF_HOME。
+# - en(WAV2VEC2_ASR_BASE_960H)、es/fr(VOXPOPULI_ASR_BASE_10K_*):
+#   torchaudio pipeline → $TORCH_HOME。
+# 新增語言時在此補語言碼(對照 whisperx DEFAULT_ALIGN_MODELS_*);注意每個
+# 語言都會加大 image 與每次 CI build 的時間(Cloud Build 無 layer cache)。
+RUN python -c "import whisperx; \
+langs = ('zh', 'en', 'ja', 'ko', 'es', 'fr'); \
+[whisperx.load_align_model(language_code=c, device='cpu') for c in langs]; \
+print('align models cached:', langs)"
 
 COPY . .
 
