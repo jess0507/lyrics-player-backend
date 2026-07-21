@@ -7,7 +7,10 @@
   把工作丟進 Cloud Tasks,由佇列非同步呼叫 aeneas / WhisperX Cloud Run 服務;
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
   ``users/{uid}/lyrics/{trackId}``(不經 RPC 回傳歌詞內文)。若該 trackId 已有
-  產生過的快照,直接回應成功、不重跑。
+  產生過的快照,直接回應成功、不重跑。派工成功後在同一份文件寫入
+  ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
+  ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
+  讓 client 全程可從 Firestore 讀到進度。
 
 皆需登入(以 callable context 的 ``auth.uid`` 為準,使用者只能操作自己的資料)。
 """
@@ -155,6 +158,34 @@ def _has_generated_snapshot(uid: str, track_id: str) -> bool:
     return data.get("source") == "generated" and bool(data.get("content"))
 
 
+def _write_queued_status(uid: str, track_id: str) -> None:
+    """把工作標記為已進佇列(``users/{uid}/lyrics/{trackId}.status = "queued"``),
+    讓 client 在收到 RPC 回應的當下就能顯示進度,不必等 Cloud Run 端點處理到
+    一半才第一次看到狀態。以 merge 寫入(該 trackId 可能還沒有 lyrics 文件、
+    或沿用舊快照的 content),並清掉上次失敗殘留的 ``error``。
+
+    只是進度提示,寫入失敗不影響已經派工成功的工作,故吞例外、只記 log。
+    """
+    db = firestore.client()
+    doc_ref = (
+        db.collection("users")
+        .document(uid)
+        .collection("lyrics")
+        .document(track_id)
+    )
+    try:
+        doc_ref.set(
+            {
+                "status": "queued",
+                "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "error": firestore.DELETE_FIELD,
+            },
+            merge=True,
+        )
+    except Exception:
+        log.exception("寫入 queued 狀態失敗(uid=%s trackId=%s)", uid, track_id)
+
+
 def _enqueue_task(queue: str, url: str, audience: str, payload: dict) -> None:
     """把工作丟進 Cloud Tasks,由佇列非同步 POST 到 Cloud Run 端點(帶 OIDC
     token 驗證身分),**不等待處理完成**——這是本次改版的核心:Function 派工
@@ -274,6 +305,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
             message=f"派工失敗:{exc}",
         )
 
+    _write_queued_status(uid, str(track_id))
     return {"saved": True, "queued": True}
 
 
@@ -362,4 +394,5 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
             message=f"派工失敗:{exc}",
         )
 
+    _write_queued_status(uid, str(track_id))
     return {"saved": True, "queued": True}

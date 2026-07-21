@@ -18,6 +18,17 @@ HTTP API(與 aeneas 服務完全一致,見 ``README.md``):
 音訊以 **先壓縮 + GCS 中轉** 提供(``audio.gcs``);另支援 ``audio.inlineBase64``
 方便本機 / 小檔測試。回傳組好的 LRC,client 寫回 ``LyricsEntity``
 (source=generated、format=lrc)。
+
+**狀態機**:有帶 ``uid``/``trackId`` 時(Cloud Tasks 派工皆會帶),本服務會
+把工作進度寫進同一份 ``users/{uid}/lyrics/{trackId}`` 文件的 ``status`` 欄位
+(``functions/main.py`` 派工成功已先寫 ``"queued"``):
+``downloading_audio`` → ``aligning``(``/align``)或 ``transcribing``
+(``/transcribe``)→ ``saving`` → ``"done"``。任何一步失敗則寫 ``"failed"``,
+並在 ``error`` 欄位附上對應的錯誤 code(``invalid_request`` /
+``audio_fetch_failed`` / ``align_model_unavailable`` / ``alignment_failed`` /
+``transcription_failed`` / ``internal`` / ``firestore_write_failed``,與
+HTTP 回應的 ``error.code`` 一致)。Cloud Tasks 重試會覆寫回較早的狀態,
+故 client 應以 Firestore 上的最新值為準,而非假設狀態只會前進。
 """
 
 from __future__ import annotations
@@ -44,17 +55,68 @@ app = Flask(__name__)
 # 防呆上限:即使壓縮後,單檔仍不該超過此值(避免濫用 / OOM)。
 _MAX_AUDIO_BYTES = 50 * 1024 * 1024
 
+# ``users/{uid}/lyrics/{trackId}.status`` 狀態機。``queued`` 由
+# ``functions/main.py`` 派工成功時寫入;本服務接力寫入其餘階段。
+# ``aligning`` 僅 ``/align`` 使用、``transcribing`` 僅 ``/transcribe`` 使用,
+# 其餘階段共用。失敗時額外寫 ``error``(沿用 ``_error()`` 的 code)。
+STATUS_DOWNLOADING_AUDIO = "downloading_audio"
+STATUS_ALIGNING = "aligning"
+STATUS_TRANSCRIBING = "transcribing"
+STATUS_SAVING = "saving"
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+
 
 def _error(code: str, message: str, status: int):
     """統一錯誤格式,client 依 ``code`` 映射 l10n。"""
     return jsonify({"error": {"code": code, "message": message}}), status
 
 
+def _write_status(uid: str, track_id: str, status: str, error: str | None = None) -> None:
+    """更新工作狀態(``users/{uid}/lyrics/{trackId}.status``),讓 client 不必
+    等最終結果就能顯示進度 / 失敗原因。以 merge 寫入,不動 ``content`` 等既有
+    欄位;成功轉下一階段時清掉舊的 ``error``。
+
+    只是進度提示,寫入失敗不該讓原本的處理流程跟著中止,故吞例外、只記 log
+    (與 :func:`_save_lyrics_snapshot` 刻意不吞例外的原則不同)。
+    """
+    from google.cloud import firestore
+
+    db = firestore.Client()
+    doc_ref = (
+        db.collection("users")
+        .document(uid)
+        .collection("lyrics")
+        .document(track_id)
+    )
+    data = {
+        "status": status,
+        "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "error": error if error else firestore.DELETE_FIELD,
+    }
+    try:
+        doc_ref.set(data, merge=True)
+    except Exception:
+        log.exception(
+            "更新狀態到 Firestore 失敗(uid=%s trackId=%s status=%s)",
+            uid,
+            track_id,
+            status,
+        )
+
+
+def _fail(uid, track_id, code: str, message: str, http_status: int):
+    """回錯誤回應前,順手把失敗狀態記回 Firestore(有 uid/trackId 才記)。"""
+    if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_FAILED, error=code)
+    return _error(code, message, http_status)
+
+
 def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None:
     """把對時 / 轉寫結果寫回 ``users/{uid}/lyrics/{trackId}``,與 App 端既有的
-    歌詞備份 schema(sync v5,見 ``lib/core/sync/lyrics_sync.dart``)完全一致
+    歌詞備份 schema(sync v5,見 ``lib/core/sync/lyrics_sync.dart``)一致
     (``title`` / ``format`` / ``source`` / ``content`` / ``addedAt`` 毫秒
-    epoch int)。
+    epoch int),並附上 ``status = "done"`` 讓狀態機收尾。
 
     由本服務(而非 ``functions/main.py``)直接寫入,是因為呼叫端(Cloud
     Tasks 派工)已經不等待處理完成、Function 早已回應——結果只能由實際做完
@@ -77,6 +139,8 @@ def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None
             "source": "generated",
             "content": lrc,
             "addedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "status": STATUS_DONE,
+            "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
         }
     )
 
@@ -105,21 +169,22 @@ def align_endpoint():
     if not isinstance(payload, dict):
         return _error("invalid_request", "需要 JSON body", 400)
 
+    # 提早取出:除了 body 不是 JSON 這種連欄位都拿不到的情況,後續任何驗證 /
+    # 執行失敗都要能把 STATUS_FAILED 寫回 Firestore(見 `_fail`)。選填,
+    # Cloud Tasks 派工時會帶上(見 `functions/main.py` align_lyrics);直接呼叫
+    # 本端點測試 / 除錯時可省略,行為等同不寫 Firestore。
+    uid = payload.get("uid")
+    track_id = payload.get("trackId")
+    title = payload.get("title")
+
     lines = payload.get("lines")
     if not isinstance(lines, list) or not any(str(x).strip() for x in lines):
-        return _error("invalid_request", "lines 需為非空字串陣列", 400)
+        return _fail(uid, track_id, "invalid_request", "lines 需為非空字串陣列", 400)
 
     language = str(payload.get("language") or "en")
     audio = payload.get("audio")
     if not isinstance(audio, dict):
-        return _error("invalid_request", "需提供 audio 物件", 400)
-
-    # 選填:Cloud Tasks 派工時會帶上,讓本服務算完結果後自行存回 Firestore
-    # (見 `functions/main.py` align_lyrics)。直接呼叫本端點測試 / 除錯時
-    # 可省略,行為等同舊版(只回結果、不寫 Firestore)。
-    uid = payload.get("uid")
-    track_id = payload.get("trackId")
-    title = payload.get("title")
+        return _fail(uid, track_id, "invalid_request", "需提供 audio 物件", 400)
 
     # 階段耗時是判斷 client 端 network/deadline-exceeded 的關鍵:可區分
     # 卡在 GCS 下載、模型載入、還是對齊太久逼近 Function 的 590s 逾時。
@@ -131,13 +196,16 @@ def align_endpoint():
         _describe_audio(audio),
     )
 
+    if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_DOWNLOADING_AUDIO)
+
     try:
         audio_path, cleanup = _resolve_audio(audio)
     except ValueError as exc:
-        return _error("invalid_request", str(exc), 400)
+        return _fail(uid, track_id, "invalid_request", str(exc), 400)
     except Exception as exc:  # GCS 下載等外部失敗
         log.exception("取得音訊失敗(已耗時 %.1fs)", time.perf_counter() - t0)
-        return _error("audio_fetch_failed", f"取得音訊失敗:{exc}", 502)
+        return _fail(uid, track_id, "audio_fetch_failed", f"取得音訊失敗:{exc}", 502)
 
     t_fetched = time.perf_counter()
     log.info(
@@ -145,6 +213,9 @@ def align_endpoint():
         os.path.getsize(audio_path) / 1024 / 1024,
         t_fetched - t0,
     )
+
+    if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_ALIGNING)
 
     try:
         result = align([str(x) for x in lines], audio_path, language)
@@ -155,13 +226,13 @@ def align_endpoint():
         log.warning(
             "對齊模型載入失敗(503,已耗時 %.1fs):%s", time.perf_counter() - t0, exc
         )
-        return _error("align_model_unavailable", str(exc), 503)
+        return _fail(uid, track_id, "align_model_unavailable", str(exc), 503)
     except AlignmentError as exc:
         log.warning("對齊失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
-        return _error("alignment_failed", str(exc), 422)
+        return _fail(uid, track_id, "alignment_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("對齊時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
-        return _error("internal", f"內部錯誤:{exc}", 500)
+        return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
 
@@ -174,6 +245,7 @@ def align_endpoint():
     )
 
     if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_SAVING)
         try:
             _save_lyrics_snapshot(str(uid), str(track_id), str(title or ""), result["lrc"])
         except Exception as exc:
@@ -182,7 +254,9 @@ def align_endpoint():
             log.exception(
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
-            return _error("firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500)
+            return _fail(
+                uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
+            )
 
     # 上傳到 GCS 的暫存音訊不在此即時刪除;清理交給 bucket lifecycle
     # (align/ 前綴定期刪),涵蓋成功與失敗路徑,後端只需讀取權限。
@@ -201,31 +275,35 @@ def transcribe_endpoint():
     if not isinstance(payload, dict):
         return _error("invalid_request", "需要 JSON body", 400)
 
+    # 選填:Cloud Tasks 派工時會帶上,讓本服務算完結果後自行存回 Firestore
+    # (見 `functions/main.py` generate_lyrics)。直接呼叫本端點測試 / 除錯時
+    # 可省略,行為等同不寫 Firestore。提早取出,讓後續任何驗證 / 執行失敗
+    # 都能把 STATUS_FAILED 寫回(見 `_fail`)。
+    uid = payload.get("uid")
+    track_id = payload.get("trackId")
+    title = payload.get("title")
+
     # 語言為選填提示;省略 → whisper 自動偵測。
     language = payload.get("language")
     audio = payload.get("audio")
     if not isinstance(audio, dict):
-        return _error("invalid_request", "需提供 audio 物件", 400)
-
-    # 選填:Cloud Tasks 派工時會帶上,讓本服務算完結果後自行存回 Firestore
-    # (見 `functions/main.py` generate_lyrics)。直接呼叫本端點測試 / 除錯時
-    # 可省略,行為等同舊版(只回結果、不寫 Firestore)。
-    uid = payload.get("uid")
-    track_id = payload.get("trackId")
-    title = payload.get("title")
+        return _fail(uid, track_id, "invalid_request", "需提供 audio 物件", 400)
 
     # 階段耗時是判斷 client 端 network/deadline-exceeded 的關鍵:可區分
     # 卡在 GCS 下載、模型載入、還是轉寫太久逼近 Function 的 590s 逾時。
     t0 = time.perf_counter()
     log.info("/transcribe 開始 lang=%s %s", language, _describe_audio(audio))
 
+    if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_DOWNLOADING_AUDIO)
+
     try:
         audio_path, cleanup = _resolve_audio(audio)
     except ValueError as exc:
-        return _error("invalid_request", str(exc), 400)
+        return _fail(uid, track_id, "invalid_request", str(exc), 400)
     except Exception as exc:  # GCS 下載等外部失敗
         log.exception("取得音訊失敗(已耗時 %.1fs)", time.perf_counter() - t0)
-        return _error("audio_fetch_failed", f"取得音訊失敗:{exc}", 502)
+        return _fail(uid, track_id, "audio_fetch_failed", f"取得音訊失敗:{exc}", 502)
 
     t_fetched = time.perf_counter()
     log.info(
@@ -234,16 +312,19 @@ def transcribe_endpoint():
         t_fetched - t0,
     )
 
+    if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_TRANSCRIBING)
+
     try:
         result = transcribe(audio_path, str(language) if language else None)
     except TranscriptionError as exc:
         # 記下「可預期失敗」的原因(辨識不出歌詞 / 音訊不可用),否則 422
         # 在 log 無痕,難以判斷是音訊問題還是模型沒抓到歌聲。
         log.warning("轉寫失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
-        return _error("transcription_failed", str(exc), 422)
+        return _fail(uid, track_id, "transcription_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("轉寫時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
-        return _error("internal", f"內部錯誤:{exc}", 500)
+        return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
 
@@ -256,6 +337,7 @@ def transcribe_endpoint():
     )
 
     if uid and track_id:
+        _write_status(str(uid), str(track_id), STATUS_SAVING)
         try:
             _save_lyrics_snapshot(str(uid), str(track_id), str(title or ""), result["lrc"])
         except Exception as exc:
@@ -264,7 +346,9 @@ def transcribe_endpoint():
             log.exception(
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
-            return _error("firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500)
+            return _fail(
+                uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
+            )
 
     # 暫存音訊清理同 /align:交給 bucket lifecycle(generate/ 前綴定期刪)。
     return jsonify(result)
