@@ -27,6 +27,7 @@ import logging
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 from typing import Callable, Tuple
 
 from flask import Flask, jsonify, request
@@ -47,6 +48,37 @@ _MAX_AUDIO_BYTES = 50 * 1024 * 1024
 def _error(code: str, message: str, status: int):
     """統一錯誤格式,client 依 ``code`` 映射 l10n。"""
     return jsonify({"error": {"code": code, "message": message}}), status
+
+
+def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None:
+    """把對時 / 轉寫結果寫回 ``users/{uid}/lyrics/{trackId}``,與 App 端既有的
+    歌詞備份 schema(sync v5,見 ``lib/core/sync/lyrics_sync.dart``)完全一致
+    (``title`` / ``format`` / ``source`` / ``content`` / ``addedAt`` 毫秒
+    epoch int)。
+
+    由本服務(而非 ``functions/main.py``)直接寫入,是因為呼叫端(Cloud
+    Tasks 派工)已經不等待處理完成、Function 早已回應——結果只能由實際做完
+    工作的這裡自己存,寫入失敗要讓呼叫端(Cloud Tasks)知道以觸發重試,
+    故**不吞例外**。
+    """
+    from google.cloud import firestore
+
+    db = firestore.Client()
+    doc_ref = (
+        db.collection("users")
+        .document(uid)
+        .collection("lyrics")
+        .document(track_id)
+    )
+    doc_ref.set(
+        {
+            "title": title or "",
+            "format": "lrc",
+            "source": "generated",
+            "content": lrc,
+            "addedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
+        }
+    )
 
 
 def _describe_audio(audio: dict) -> str:
@@ -81,6 +113,13 @@ def align_endpoint():
     audio = payload.get("audio")
     if not isinstance(audio, dict):
         return _error("invalid_request", "需提供 audio 物件", 400)
+
+    # 選填:Cloud Tasks 派工時會帶上,讓本服務算完結果後自行存回 Firestore
+    # (見 `functions/main.py` align_lyrics)。直接呼叫本端點測試 / 除錯時
+    # 可省略,行為等同舊版(只回結果、不寫 Firestore)。
+    uid = payload.get("uid")
+    track_id = payload.get("trackId")
+    title = payload.get("title")
 
     # 階段耗時是判斷 client 端 network/deadline-exceeded 的關鍵:可區分
     # 卡在 GCS 下載、模型載入、還是對齊太久逼近 Function 的 590s 逾時。
@@ -133,6 +172,18 @@ def align_endpoint():
         time.perf_counter() - t_fetched,
         time.perf_counter() - t0,
     )
+
+    if uid and track_id:
+        try:
+            _save_lyrics_snapshot(str(uid), str(track_id), str(title or ""), result["lrc"])
+        except Exception as exc:
+            # 寫入失敗回 5xx,讓 Cloud Tasks 依佇列重試設定重送;不吞例外,
+            # 否則會有「對時算完了但沒人知道、也沒存到」的靜默遺失。
+            log.exception(
+                "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
+            )
+            return _error("firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500)
+
     # 上傳到 GCS 的暫存音訊不在此即時刪除;清理交給 bucket lifecycle
     # (align/ 前綴定期刪),涵蓋成功與失敗路徑,後端只需讀取權限。
     return jsonify(result)
@@ -155,6 +206,13 @@ def transcribe_endpoint():
     audio = payload.get("audio")
     if not isinstance(audio, dict):
         return _error("invalid_request", "需提供 audio 物件", 400)
+
+    # 選填:Cloud Tasks 派工時會帶上,讓本服務算完結果後自行存回 Firestore
+    # (見 `functions/main.py` generate_lyrics)。直接呼叫本端點測試 / 除錯時
+    # 可省略,行為等同舊版(只回結果、不寫 Firestore)。
+    uid = payload.get("uid")
+    track_id = payload.get("trackId")
+    title = payload.get("title")
 
     # 階段耗時是判斷 client 端 network/deadline-exceeded 的關鍵:可區分
     # 卡在 GCS 下載、模型載入、還是轉寫太久逼近 Function 的 590s 逾時。
@@ -196,6 +254,18 @@ def transcribe_endpoint():
         time.perf_counter() - t_fetched,
         time.perf_counter() - t0,
     )
+
+    if uid and track_id:
+        try:
+            _save_lyrics_snapshot(str(uid), str(track_id), str(title or ""), result["lrc"])
+        except Exception as exc:
+            # 寫入失敗回 5xx,讓 Cloud Tasks 依佇列重試設定重送;不吞例外,
+            # 否則會有「轉寫算完了但沒人知道、也沒存到」的靜默遺失。
+            log.exception(
+                "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
+            )
+            return _error("firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500)
+
     # 暫存音訊清理同 /align:交給 bucket lifecycle(generate/ 前綴定期刪)。
     return jsonify(result)
 

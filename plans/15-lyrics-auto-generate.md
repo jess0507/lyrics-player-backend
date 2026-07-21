@@ -87,8 +87,10 @@ Response 200:`{ "lrc": "...", "fragments": [...], "language": "zh" }`(與 `/alig
 - **rate limit**:轉寫比對齊更重,**用獨立、更低的每日上限**(例如
   `GENERATE_RATE_LIMIT_PER_DAY`,預設低於對時的 20);`align_usage` 改用獨立 doc
   `generate_usage/{uid}` 或同 doc 加欄位,避免互相吃額度。
-- 轉呼 `/transcribe`,回 `{lrc, language}`;錯誤碼映射比照 `align_lyrics`
-  (422→`failed-precondition`、502/503→`unavailable`…)。
+- 轉呼 `/transcribe`,取得 lrc 後直接存入 Firestore
+  `users/{uid}/lyrics/{trackId}`,**不經 RPC 回傳歌詞內文**,只回
+  `{saved: true, language}`(2026-07-20 改版,見文末增補);錯誤碼映射比照
+  `align_lyrics`(422→`failed-precondition`、502/503→`unavailable`…)。
 
 ## Flutter:新增 `lib/features/lyrics/auto_generate/`(鏡像 `auto_sync/`)
 
@@ -99,8 +101,10 @@ Response 200:`{ "lrc": "...", "fragments": [...], "language": "zh" }`(與 `/alig
   - **不讀既有歌詞**(本就為無歌詞曲目);觸發前置條件是「**沒有**歌詞」而非「有純文字」。
   - 複用 `audioCompressorProvider` 壓縮、`FirebaseStorage` 上傳(改前綴 `generate/{uid}/`)、
     `_resolveAudioPath`(可抽共用 helper)。
-  - 呼叫 `generate_lyrics` callable;回傳 LRC 寫回 `LyricsEntity`
-    (`source = generated`、`format = lrc`)、`invalidate(trackLyricsProvider)`。
+  - 呼叫 `generate_lyrics` callable(帶 `trackId`/`title`,必填);成功後
+    讀回後端剛存的 `users/{uid}/lyrics/{trackId}` 快照取得內文,寫回
+    `LyricsEntity`(`source = generated`、`format = lrc`)、
+    `invalidate(trackLyricsProvider)`。
   - 階段 enum 去掉「需既有文字」相關,沿用 compressing / uploading / 改名
     transcribing(對應 aligning)。錯誤 enum 比照,新增 `transcriptionFailed`。
 - `lyrics_auto_generate_controller.dart`:鏡像 `LyricsAutoSyncController`
@@ -161,6 +165,24 @@ Response 200:`{ "lrc": "...", "fragments": [...], "language": "zh" }`(與 `/alig
 - 設 `WHISPERX_SERVICE_URL`(已存在)即可路由;確認 `generate_lyrics` 的
   `run.invoker` 與 `generate/` 前綴的 bucket lifecycle(比照 `align/`)。
 - 依實測決定是否需要 demucs 前處理 / GPU。
+
+## 增補:`generate_lyrics` 改為直存 Firestore、不經 RPC 回傳內文(2026-07-20)
+
+與 `align_lyrics` 同步改版(理由、失敗語意、App 端讀回寫本機的必要性見
+`plans/12-lyrics-auto-sync-aeneas.md` 對應增補,原理完全一致,不重複贅述)。
+差異僅在:`_save_lyrics_snapshot` 寫入失敗現在**兩支 callable 都會**轉成
+`HttpsError`(原本 `generate_lyrics` 走靜默 best-effort 的差異化處理已隨此次
+改版一併收斂,不再區分)。`lyrics_auto_generate_service.dart` 的 `generate()`
+比照 `lyrics_auto_sync_service.dart` 的 `autoSync()` 補上「callable 成功後
+讀回 Firestore 快照寫本機」的步驟。
+
+## 增補:改為 Cloud Tasks 非同步派工、不等轉寫完成(2026-07-20)
+
+與 `align_lyrics` 同步改版(架構、失敗語意、Cloud Run 自寫 Firestore、
+App 端依 `cached`/`queued` 分流、GCP 待辦事項見
+`plans/12-lyrics-auto-sync-aeneas.md` 對應增補,原理完全一致,不重複贅述)。
+`whisperx_service/main.py` 的 `/transcribe` 端點與 `/align` 一併加上選填
+`uid`/`trackId`/`title` 及自寫 Firestore 邏輯。
 
 ---
 

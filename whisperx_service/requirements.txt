@@ -6,6 +6,7 @@
 flask==3.0.3
 gunicorn==21.2.0
 google-cloud-storage==2.14.0
+google-cloud-firestore==2.16.0
 # pyannote.audio(whisperx 連帶)仍用 np.NaN,NumPy 2.0 已移除 → import 時崩潰。
 # 釘在 1.x 以相容;torch 2.2.2 亦相容 numpy<2。
 numpy<2.0

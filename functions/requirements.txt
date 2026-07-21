@@ -1,6 +1,6 @@
 firebase-functions>=0.4.2
 firebase-admin>=6.5.0
 
-# align_lyrics:取 Cloud Run ID token + 轉呼 /align。
-google-auth>=2.28.0
-requests>=2.31.0
+# align_lyrics / generate_lyrics:派工到 Cloud Tasks,由佇列非同步呼叫
+# Cloud Run(OIDC token 由 Cloud Tasks 代簽,Function 本身不再直連 Cloud Run)。
+google-cloud-tasks>=2.16.0
