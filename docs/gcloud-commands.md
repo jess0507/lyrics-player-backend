@@ -45,3 +45,27 @@
     gcloud storage buckets update gs://seek-player-f724e.firebasestorage.app \                                                                                                                                                             
         --lifecycle-file=aeneas_service/storage-lifecycle.json
     ```
+
+## 查看 Cloud Run 的 cpu / memory / instance 數量
+```bash
+gcloud run services describe whisperx-align \
+    --project seek-player-f724e \
+    --region asia-east1 \
+    --format="yaml(spec.template.spec.containers[0].resources, spec.template.spec.containerConcurrency, spec.template.metadata.annotations)"
+```
+
+## 調整 Cloud Run 的 cpu / memory / instance 數量
+只改設定、不重新部署程式碼,用 `gcloud run services update`,把 `<SERVICE>` 換成 `whisperx-align` 或 `aeneas-align`:
+```bash
+gcloud run services update <SERVICE> \
+    --project seek-player-f724e \
+    --region asia-east1 \
+    --cpu <CPU數量,例如 2 或 4> \
+    --memory <記憶體,例如 2Gi 或 8Gi> \
+    --concurrency <每個 instance 同時處理幾個請求,例如 1> \
+    --min-instances <最小 instance 數,例如 0> \
+    --max-instances <最大 instance 數,例如 3>
+```
+- `--min-instances 0`:沒流量時縮到 0,省錢但會冷啟動。
+- `--min-instances 1` 以上:保留常駐 instance,避免冷啟動,但會持續計費。
+- 只想調其中幾項,把不需要的旗標拿掉即可,其餘設定會維持原值。

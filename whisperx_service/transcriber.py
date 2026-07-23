@@ -112,8 +112,10 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
         language: 語言提示(選填)。預設 ``None`` → whisper 自動偵測語言;
             給值時正規化為二字母碼鎖定,避免歌聲誤判。
 
-    回傳 ``{"lrc": str, "fragments": [...], "language": str}``。
-    失敗丟 :class:`TranscriptionError`(音訊不可用 / 辨識不出歌詞 / 模型不可用)。
+    回傳 ``{"lrc": str, "fragments": [...], "language": str,
+    "durationSeconds": float}``(``durationSeconds`` 供呼叫端累加每月配額用量,
+    不對外回傳)。失敗丟 :class:`TranscriptionError`(音訊不可用 / 辨識不出歌詞 /
+    模型不可用)。
     """
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
         raise TranscriptionError("音訊檔不存在或為空")
@@ -157,8 +159,8 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
     if not any(_clean_segment_text(s.get("text")) for s in raw_segments):
         raise TranscriptionError("未辨識出任何歌詞文字")
 
-    # 字級對齊精修每段時間;複用對齊路線的模型快取。對齊失敗不致整批失敗——
-    # 退回 ASR 段級時間(粒度較粗但仍可用)。
+    # 字級對齊精修每段時間;複用對齊路線的 _load_align_model(不快取模型,
+    # 每次重新載入)。對齊失敗不致整批失敗——退回 ASR 段級時間(粒度較粗但仍可用)。
     segments = raw_segments
     t_align = time.perf_counter()
     try:
@@ -188,4 +190,5 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
         "lrc": build_lrc(fragments),
         "fragments": fragments,
         "language": lang,
+        "durationSeconds": duration,
     }

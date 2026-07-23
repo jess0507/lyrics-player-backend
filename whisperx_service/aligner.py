@@ -90,8 +90,10 @@ _LANGUAGE_MAP = {
 # 不應插入空格;其餘語言以單一空格分隔,避免相鄰行尾首字被黏成同一個 token。
 _LANGUAGES_WITHOUT_SPACES = {"zh", "ja"}
 
-# 對齊模型載入昂貴(會下載 wav2vec2 權重),以語言碼為 key 做行程內快取。
-_ALIGN_MODEL_CACHE: Dict[str, tuple] = {}
+# 對齊模型權重已在 build time 預烤進 image(見 Dockerfile),每次呼叫
+# load_align_model 皆為本機磁碟載入、不打 HuggingFace 網路,成本已不高。
+# 故不做行程內快取——避免同一 instance 存活期間陸續處理多語言時,快取
+# 疊加多個 ~1.2GB 模型且無淘汰機制,把記憶體用量無上限撐大。
 
 
 def normalize_language(code: str) -> str:
@@ -414,10 +416,10 @@ def _char_alignments(model, metadata: dict, audio, text: str) -> List[dict]:
 
 
 def _load_align_model(language: str):
-    """載入(並快取)whisperx 的 wav2vec2 對齊模型。CPU 推論(Cloud Run 無 GPU)。"""
-    cached = _ALIGN_MODEL_CACHE.get(language)
-    if cached is not None:
-        return cached
+    """載入 whisperx 的 wav2vec2 對齊模型。CPU 推論(Cloud Run 無 GPU)。
+
+    每次呼叫都重新載入(不快取),見模組上方說明。
+    """
     import whisperx  # 延後 import:重依賴只在實際對齊時載入。
 
     try:
@@ -426,7 +428,6 @@ def _load_align_model(language: str):
         )
     except Exception as exc:  # 該語言無對齊模型 / 下載失敗
         raise ModelLoadError(f"無對齊模型可用({language}):{exc}") from exc
-    _ALIGN_MODEL_CACHE[language] = (model, metadata)
     return model, metadata
 
 
@@ -438,8 +439,9 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
         audio_path: 本機音訊檔路徑(任何 ffmpeg 解得的格式)。
         language: 客戶端語言碼(會經 :func:`normalize_language` 正規化)。
 
-    回傳 dict:``{"lrc": str, "fragments": [...], "language": str}``。
-    失敗丟 :class:`AlignmentError`(覆蓋率過低 / 無法對齊 / 模型不可用)。
+    回傳 dict:``{"lrc": str, "fragments": [...], "language": str,
+    "durationSeconds": float}``(``durationSeconds`` 供呼叫端累加每月配額用量,
+    不對外回傳)。失敗丟 :class:`AlignmentError`(覆蓋率過低 / 無法對齊 / 模型不可用)。
     """
     clean = _clean_lines(lines)
     if not clean:
@@ -491,4 +493,5 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
         "lrc": build_lrc(fragments),
         "fragments": fragments,
         "language": lang,
+        "durationSeconds": duration,
     }

@@ -2,8 +2,8 @@
 
 本機測試 `POST /align`(既有歌詞 + 音訊 → 同步 LRC)的完整流程。
 
-## 快速開始(推薦:`dev_test.sh`)
-每次測試就下一次指令
+## 快速開始
+- 每次測試就下一次指令
 ```bash
 cd whisperx_service
 ./dev_test.sh --audio song.mp3 --lyrics lyrics.txt -l zh-TW --endpoint align

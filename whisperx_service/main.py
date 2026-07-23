@@ -105,6 +105,34 @@ def _write_status(uid: str, track_id: str, status: str, error: str | None = None
         )
 
 
+def _add_monthly_usage(uid: str, seconds: float) -> None:
+    """把這次實際處理的音訊秒數加進 ``usage/{uid}``(``{month: "YYYY-MM",
+    secondsUsed: n}``),供 ``functions/main.py`` 的 ``_monthly_quota_exceeded``
+    檢查每月配額用量(對時 / 自動產生合併計算)。以 ``month`` 變更判定跨月
+    歸零,無需排程清理。
+
+    只是用量記帳,失敗不該讓已經存好的歌詞結果跟著回錯,故吞例外、只記 log
+    (與 ``_write_status`` 同樣的原則)。
+    """
+    from google.cloud import firestore
+
+    db = firestore.Client()
+    ref = db.collection("usage").document(uid)
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    @firestore.transactional
+    def _txn(transaction) -> None:
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() or {}
+        current = data.get("secondsUsed", 0) if data.get("month") == month else 0
+        transaction.set(ref, {"month": month, "secondsUsed": current + seconds})
+
+    try:
+        _txn(db.transaction())
+    except Exception:
+        log.exception("寫入本月用量失敗(uid=%s)", uid)
+
+
 def _fail(uid, track_id, code: str, message: str, http_status: int):
     """回錯誤回應前,順手把失敗狀態記回 Firestore(有 uid/trackId 才記)。"""
     if uid and track_id:
@@ -236,6 +264,7 @@ def align_endpoint():
     finally:
         cleanup()
 
+    duration_seconds = result.pop("durationSeconds", 0.0)
     log.info(
         "/align 完成 行數=%d lang=%s,對齊耗時 %.1fs(總計 %.1fs)",
         len(result.get("fragments") or []),
@@ -257,6 +286,7 @@ def align_endpoint():
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )
+        _add_monthly_usage(str(uid), duration_seconds)
 
     # 上傳到 GCS 的暫存音訊不在此即時刪除;清理交給 bucket lifecycle
     # (align/ 前綴定期刪),涵蓋成功與失敗路徑,後端只需讀取權限。
@@ -328,6 +358,7 @@ def transcribe_endpoint():
     finally:
         cleanup()
 
+    duration_seconds = result.pop("durationSeconds", 0.0)
     log.info(
         "/transcribe 完成 行數=%d lang=%s,轉寫耗時 %.1fs(總計 %.1fs)",
         len(result.get("fragments") or []),
@@ -349,6 +380,7 @@ def transcribe_endpoint():
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )
+        _add_monthly_usage(str(uid), duration_seconds)
 
     # 暫存音訊清理同 /align:交給 bucket lifecycle(generate/ 前綴定期刪)。
     return jsonify(result)

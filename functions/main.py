@@ -60,18 +60,14 @@ _GENERATE_TASK_QUEUE = os.environ.get("GENERATE_TASK_QUEUE", "generate-lyrics")
 # roles/iam.serviceAccountTokenCreator,才能請 Cloud Tasks 代簽,見部署待辦)。
 _TASKS_INVOKER_SERVICE_ACCOUNT = os.environ.get("TASKS_INVOKER_SERVICE_ACCOUNT", "")
 
-# 每位使用者每日可呼叫對時的次數上限(防濫用 / 控成本)。可用環境變數覆寫,
-# 詳見 plans/lyrics-auto-sync-aeneas.md。
-_ALIGN_RATE_LIMIT_PER_DAY = int(os.environ.get("ALIGN_RATE_LIMIT_PER_DAY", "20"))
-
-# 每位使用者每日可呼叫「自動產生歌詞」的次數上限。轉寫(ASR)比對時更重,
-# 預設低於對時,並以獨立計數(generate_usage)不與對時互吃額度。
-_GENERATE_RATE_LIMIT_PER_DAY = int(
-    os.environ.get("GENERATE_RATE_LIMIT_PER_DAY", "5")
+# 每位使用者每月可用的對時 / 自動產生歌詞總時長上限(秒),兩功能合併計算、
+# 以實際音訊秒數計費(而非呼叫次數)。可用環境變數覆寫。
+_MONTHLY_QUOTA_SECONDS = int(
+    os.environ.get("MONTHLY_QUOTA_SECONDS", str(60 * 60))
 )
 
-# 不受每日上限限制的測試 / 內部帳號 uid(逗號分隔),供 QA 反覆測試。
-# 名單內的 uid 在 align_lyrics / generate_lyrics 皆跳過配額(不計數)。
+# 不受每月上限限制的測試 / 內部帳號 uid(逗號分隔),供 QA 反覆測試。
+# 名單內的 uid 在 align_lyrics / generate_lyrics 皆跳過配額檢查。
 _RATE_LIMIT_EXEMPT_UIDS = {
     u.strip()
     for u in os.environ.get("RATE_LIMIT_EXEMPT_UIDS", "").split(",")
@@ -112,31 +108,26 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
     return {"deleted": True, "uid": uid}
 
 
-def _consume_daily_quota(collection: str, uid: str, limit: int) -> bool:
-    """以交易方式檢查並累加某使用者當日用量;超過上限回 False(不累加)。
+def _monthly_quota_exceeded(uid: str) -> bool:
+    """檢查使用者本月(對時 + 自動產生合併計算)用量是否已達上限。
 
-    紀錄於 ``{collection}/{uid}``(`{day: 'YYYY-MM-DD', count: n}`),每日自動歸零
-    (以 ``day`` 變更判定,無需排程清理)。對時 / 自動產生各用獨立 collection。
+    只檢查、不累加——實際用量是處理完成後,由 Cloud Run 服務依實際音訊秒數
+    寫入 ``usage/{uid}``(``{month: "YYYY-MM", secondsUsed: n}``,見
+    ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的
+    ``_add_monthly_usage``)。以 ``month`` 變更判定跨月,無需排程歸零。
     """
-    # 豁免帳號(測試 / 內部)不受上限限制,也不累加用量。
+    # 豁免帳號(測試 / 內部)不受上限限制。
     if uid in _RATE_LIMIT_EXEMPT_UIDS:
-        return True
+        return False
 
-    db = firestore.client()
-    ref = db.collection(collection).document(uid)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    @firestore.transactional
-    def _txn(transaction) -> bool:
-        snap = ref.get(transaction=transaction)
-        data = snap.to_dict() or {}
-        count = data.get("count", 0) if data.get("day") == today else 0
-        if count >= limit:
-            return False
-        transaction.set(ref, {"day": today, "count": count + 1})
-        return True
-
-    return _txn(db.transaction())
+    doc = firestore.client().collection("usage").document(uid).get()
+    if not doc.exists:
+        return False
+    data = doc.to_dict() or {}
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    if data.get("month") != current_month:
+        return False
+    return data.get("secondsUsed", 0) >= _MONTHLY_QUOTA_SECONDS
 
 
 def _has_generated_snapshot(uid: str, track_id: str) -> bool:
@@ -156,6 +147,33 @@ def _has_generated_snapshot(uid: str, track_id: str) -> bool:
         return False
     data = doc.to_dict() or {}
     return data.get("source") == "generated" and bool(data.get("content"))
+
+
+_IN_PROGRESS_STATUSES = {
+    "queued",
+    "downloading_audio",
+    "aligning",
+    "transcribing",
+    "saving",
+}
+
+
+def _task_in_progress(uid: str, track_id: str) -> bool:
+    """檢查 ``users/{uid}/lyrics/{trackId}`` 是否已有工作在跑(status 屬於
+    ``_IN_PROGRESS_STATUSES``)。用來擋使用者短時間內連點造成的重複派工——
+    命中的話直接回應已排隊,不再消耗每日配額、也不再建立新 Cloud Task。
+    """
+    doc = (
+        firestore.client()
+        .collection("users")
+        .document(uid)
+        .collection("lyrics")
+        .document(track_id)
+        .get()
+    )
+    if not doc.exists:
+        return False
+    return (doc.to_dict() or {}).get("status") in _IN_PROGRESS_STATUSES
 
 
 def _write_queued_status(uid: str, track_id: str) -> None:
@@ -256,6 +274,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INTERNAL,
             message="對時服務未設定(缺 ALIGN_SERVICE_URL)。",
+            details={"code": "service_unavailable"},
         )
     if (
         not isinstance(lines, list)
@@ -267,15 +286,20 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
             message="缺少 lines / bucket / object / trackId。",
+            details={"code": "invalid_request"},
         )
 
     if _has_generated_snapshot(uid, str(track_id)):
         return {"saved": True, "cached": True}
 
-    if not _consume_daily_quota("align_usage", uid, _ALIGN_RATE_LIMIT_PER_DAY):
+    if _task_in_progress(uid, str(track_id)):
+        return {"saved": True, "queued": True}
+
+    if _monthly_quota_exceeded(uid):
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
-            message="今日自動對時次數已達上限,請明天再試。",
+            message="本月自動對時/產生歌詞額度已用盡,請下個月再試。",
+            details={"code": "quota_exceeded"},
         )
 
     # 暫存音訊的清理交給 bucket lifecycle(align/ 前綴定期刪),後端不即時刪除,
@@ -303,6 +327,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INTERNAL,
             message=f"派工失敗:{exc}",
+            details={"code": "dispatch_failed"},
         )
 
     _write_queued_status(uid, str(track_id))
@@ -349,22 +374,26 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INTERNAL,
             message="歌詞產生服務未設定(缺 WHISPERX_SERVICE_URL)。",
+            details={"code": "service_unavailable"},
         )
     if not bucket or not obj or not track_id:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
             message="缺少 bucket / object / trackId。",
+            details={"code": "invalid_request"},
         )
 
     if _has_generated_snapshot(uid, str(track_id)):
         return {"saved": True, "cached": True}
 
-    if not _consume_daily_quota(
-        "generate_usage", uid, _GENERATE_RATE_LIMIT_PER_DAY
-    ):
+    if _task_in_progress(uid, str(track_id)):
+        return {"saved": True, "queued": True}
+
+    if _monthly_quota_exceeded(uid):
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
-            message="今日自動產生歌詞次數已達上限,請明天再試。",
+            message="本月自動對時/產生歌詞額度已用盡,請下個月再試。",
+            details={"code": "quota_exceeded"},
         )
 
     audio = {"gcs": {"bucket": bucket, "object": obj}}
@@ -392,6 +421,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INTERNAL,
             message=f"派工失敗:{exc}",
+            details={"code": "dispatch_failed"},
         )
 
     _write_queued_status(uid, str(track_id))

@@ -66,8 +66,9 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
         audio_path: 本機音訊檔路徑(任何 ffmpeg 解得的格式)。
         language: 客戶端語言碼(會經 :func:`normalize_language` 正規化)。
 
-    回傳 dict:``{"lrc": str, "fragments": [...], "language": str}``。
-    失敗丟 :class:`AlignmentError`。
+    回傳 dict:``{"lrc": str, "fragments": [...], "language": str,
+    "durationSeconds": float}``(``durationSeconds`` 供呼叫端累加每月配額用量,
+    不對外回傳)。失敗丟 :class:`AlignmentError`。
     """
     clean = _clean_lines(lines)
     if not clean:
@@ -84,10 +85,15 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
             f"對齊片段數({len(fragments)})與歌詞行數({len(clean)})不符"
         )
 
+    # aeneas 不像 whisperx 會解碼整段音訊,沒有現成的音檔總長度;以最後一個
+    # fragment 的結束時間作為近似值(供每月配額用量計費,只需大致成正比)。
+    duration = fragments[-1]["end"] if fragments else 0.0
+
     return {
         "lrc": build_lrc(fragments),
         "fragments": fragments,
         "language": lang,
+        "durationSeconds": duration,
     }
 
 
