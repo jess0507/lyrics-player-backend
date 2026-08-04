@@ -20,7 +20,7 @@ HTTP API(與 aeneas 服務完全一致,見 ``README.md``):
 (source=generated、format=lrc)。
 
 **狀態機**:有帶 ``uid``/``trackId`` 時(Cloud Tasks 派工皆會帶),本服務會
-把工作進度寫進同一份 ``users/{uid}/lyrics/{trackId}`` 文件的 ``status`` 欄位
+把工作進度寫進同一份 ``user/{uid}/lyrics/{trackId}`` 文件的 ``status`` 欄位
 (``functions/main.py`` 派工成功已先寫 ``"queued"``):
 ``downloading_audio`` → ``aligning``(``/align``)或 ``transcribing``
 (``/transcribe``)→ ``saving`` → ``"done"``。任何一步失敗則寫 ``"failed"``,
@@ -55,7 +55,7 @@ app = Flask(__name__)
 # 防呆上限:即使壓縮後,單檔仍不該超過此值(避免濫用 / OOM)。
 _MAX_AUDIO_BYTES = 50 * 1024 * 1024
 
-# ``users/{uid}/lyrics/{trackId}.status`` 狀態機。``queued`` 由
+# ``user/{uid}/lyrics/{trackId}.status`` 狀態機。``queued`` 由
 # ``functions/main.py`` 派工成功時寫入;本服務接力寫入其餘階段。
 # ``aligning`` 僅 ``/align`` 使用、``transcribing`` 僅 ``/transcribe`` 使用,
 # 其餘階段共用。失敗時額外寫 ``error``(沿用 ``_error()`` 的 code)。
@@ -73,7 +73,7 @@ def _error(code: str, message: str, status: int):
 
 
 def _write_status(uid: str, track_id: str, status: str, error: str | None = None) -> None:
-    """更新工作狀態(``users/{uid}/lyrics/{trackId}.status``),讓 client 不必
+    """更新工作狀態(``user/{uid}/lyrics/{trackId}.status``),讓 client 不必
     等最終結果就能顯示進度 / 失敗原因。以 merge 寫入,不動 ``content`` 等既有
     欄位;成功轉下一階段時清掉舊的 ``error``。
 
@@ -84,7 +84,7 @@ def _write_status(uid: str, track_id: str, status: str, error: str | None = None
 
     db = firestore.Client()
     doc_ref = (
-        db.collection("users")
+        db.collection("user")
         .document(uid)
         .collection("lyrics")
         .document(track_id)
@@ -141,7 +141,7 @@ def _fail(uid, track_id, code: str, message: str, http_status: int):
 
 
 def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None:
-    """把對時 / 轉寫結果寫回 ``users/{uid}/lyrics/{trackId}``,與 App 端既有的
+    """把對時 / 轉寫結果寫回 ``user/{uid}/lyrics/{trackId}``,與 App 端既有的
     歌詞備份 schema(sync v5,見 ``lib/core/sync/lyrics_sync.dart``)一致
     (``title`` / ``format`` / ``source`` / ``content`` / ``addedAt`` 毫秒
     epoch int),並附上 ``status = "done"`` 讓狀態機收尾。
@@ -155,7 +155,7 @@ def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None
 
     db = firestore.Client()
     doc_ref = (
-        db.collection("users")
+        db.collection("user")
         .document(uid)
         .collection("lyrics")
         .document(track_id)

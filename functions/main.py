@@ -1,12 +1,12 @@
 """Seek Player 帳號相關 Cloud Functions。
 
 提供三支 callable function:
-- ``delete_account_data``:只刪除使用者的雲端資料(Firestore ``users/{uid}``),保留登入帳號。
+- ``delete_account_data``:只刪除使用者的雲端資料(Firestore ``user/{uid}``),保留登入帳號。
 - ``delete_account``:刪除雲端資料後,再刪除使用者的 Firebase Auth 帳號。
 - ``align_lyrics`` / ``generate_lyrics``:歌詞自動對時 / 自動產生——驗證 + 配額後,
   把工作丟進 Cloud Tasks,由佇列非同步呼叫 aeneas / WhisperX Cloud Run 服務;
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
-  ``users/{uid}/lyrics/{trackId}``(不經 RPC 回傳歌詞內文)。若該 trackId 已有
+  ``user/{uid}/lyrics/{trackId}``(不經 RPC 回傳歌詞內文)。若該 trackId 已有
   產生過的快照,直接回應成功、不重跑。派工成功後在同一份文件寫入
   ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
   ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
@@ -86,9 +86,9 @@ def _require_uid(req: https_fn.CallableRequest) -> str:
 
 
 def _delete_user_data(uid: str) -> None:
-    """遞迴刪除 Firestore ``users/{uid}`` 文件及其所有 subcollection。"""
+    """遞迴刪除 Firestore ``user/{uid}`` 文件及其所有 subcollection。"""
     db = firestore.client()
-    db.recursive_delete(db.collection("users").document(uid))
+    db.recursive_delete(db.collection("user").document(uid))
 
 
 @https_fn.on_call(region=_REGION)
@@ -131,13 +131,13 @@ def _monthly_quota_exceeded(uid: str) -> bool:
 
 
 def _has_generated_snapshot(uid: str, track_id: str) -> bool:
-    """檢查 ``users/{uid}/lyrics/{trackId}`` 是否已有對時 / 自動產生過的快照
+    """檢查 ``user/{uid}/lyrics/{trackId}`` 是否已有對時 / 自動產生過的快照
     (``source=generated`` 且有內文)。已有的話代表這首歌處理過,不必重跑——
     ``align_lyrics`` / ``generate_lyrics`` 據此直接回應成功、不再派工。
     """
     doc = (
         firestore.client()
-        .collection("users")
+        .collection("user")
         .document(uid)
         .collection("lyrics")
         .document(track_id)
@@ -159,13 +159,13 @@ _IN_PROGRESS_STATUSES = {
 
 
 def _task_in_progress(uid: str, track_id: str) -> bool:
-    """檢查 ``users/{uid}/lyrics/{trackId}`` 是否已有工作在跑(status 屬於
+    """檢查 ``user/{uid}/lyrics/{trackId}`` 是否已有工作在跑(status 屬於
     ``_IN_PROGRESS_STATUSES``)。用來擋使用者短時間內連點造成的重複派工——
     命中的話直接回應已排隊,不再消耗每日配額、也不再建立新 Cloud Task。
     """
     doc = (
         firestore.client()
-        .collection("users")
+        .collection("user")
         .document(uid)
         .collection("lyrics")
         .document(track_id)
@@ -177,7 +177,7 @@ def _task_in_progress(uid: str, track_id: str) -> bool:
 
 
 def _write_queued_status(uid: str, track_id: str) -> None:
-    """把工作標記為已進佇列(``users/{uid}/lyrics/{trackId}.status = "queued"``),
+    """把工作標記為已進佇列(``user/{uid}/lyrics/{trackId}.status = "queued"``),
     讓 client 在收到 RPC 回應的當下就能顯示進度,不必等 Cloud Run 端點處理到
     一半才第一次看到狀態。以 merge 寫入(該 trackId 可能還沒有 lyrics 文件、
     或沿用舊快照的 content),並清掉上次失敗殘留的 ``error``。
@@ -186,7 +186,7 @@ def _write_queued_status(uid: str, track_id: str) -> None:
     """
     db = firestore.client()
     doc_ref = (
-        db.collection("users")
+        db.collection("user")
         .document(uid)
         .collection("lyrics")
         .document(track_id)
@@ -239,7 +239,7 @@ def _enqueue_task(queue: str, url: str, audience: str, payload: dict) -> None:
 def align_lyrics(req: https_fn.CallableRequest) -> dict:
     """歌詞自動對時:驗證 + 配額後,把工作丟進 Cloud Tasks 非同步轉呼 aeneas /
     WhisperX Cloud Run 的 ``/align``,**立刻回應、不等對時完成**。對時結果由
-    Cloud Run 端點自行存入 Firestore ``users/{uid}/lyrics/{trackId}``
+    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{trackId}``
     (不經本 RPC 回傳歌詞內文)。
 
     Request data:
@@ -249,7 +249,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``language``: str(選填),語言碼,預設 ``eng``。
         - ``format``: str(選填),音訊副檔名提示。
         - ``trackId``: str,曲目 id(內容指紋);結果的存放位置
-          (``users/{uid}/lyrics/{trackId}``),必填。
+          (``user/{uid}/lyrics/{trackId}``),必填。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意:
@@ -342,7 +342,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
 def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     """歌詞自動產生:驗證 + 配額後,把工作丟進 Cloud Tasks 非同步轉呼
     WhisperX Cloud Run 的 ``/transcribe``,**立刻回應、不等轉寫完成**。結果由
-    Cloud Run 端點自行存入 Firestore ``users/{uid}/lyrics/{trackId}``
+    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{trackId}``
     (不經本 RPC 回傳歌詞內文)。
 
     與 ``align_lyrics`` 的差別:**沒有既有文字**(不需 ``lines``),由後端 ASR
@@ -354,7 +354,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``language``: str(選填),語言提示;省略則後端自動偵測。
         - ``format``: str(選填),音訊副檔名提示。
         - ``trackId``: str,曲目 id(內容指紋);結果的存放位置
-          (``users/{uid}/lyrics/{trackId}``),必填。
+          (``user/{uid}/lyrics/{trackId}``),必填。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意同 ``align_lyrics``:``{"saved": True, "cached": True}`` 或
