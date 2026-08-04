@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -111,6 +112,10 @@ def _add_monthly_usage(uid: str, seconds: float) -> None:
     檢查每月配額用量(對時 / 自動產生合併計算)。以 ``month`` 變更判定跨月
     歸零,無需排程清理。
 
+    ``seconds`` 可為負數,供處理失敗時把先前(下載完成、音訊長度一知道就先
+    記的)用量扣回(見 ``align_endpoint`` / ``transcribe_endpoint``)——
+    ``max(0, ...)`` 避免扣成負數(例如扣回當下已跨月、本月尚未有其他用量)。
+
     只是用量記帳,失敗不該讓已經存好的歌詞結果跟著回錯,故吞例外、只記 log
     (與 ``_write_status`` 同樣的原則)。
     """
@@ -125,12 +130,41 @@ def _add_monthly_usage(uid: str, seconds: float) -> None:
         snap = ref.get(transaction=transaction)
         data = snap.to_dict() or {}
         current = data.get("secondsUsed", 0) if data.get("month") == month else 0
-        transaction.set(ref, {"month": month, "secondsUsed": current + seconds})
+        transaction.set(
+            ref, {"month": month, "secondsUsed": max(0.0, current + seconds)}
+        )
 
     try:
         _txn(db.transaction())
     except Exception:
         log.exception("寫入本月用量失敗(uid=%s)", uid)
+
+
+def _probe_duration_seconds(audio_path: str) -> float:
+    """用 ffprobe 量測音訊實際長度(秒)。
+
+    音訊一下載完成就能知道長度,不必等對齊 / 轉寫跑完——
+    ``align_endpoint`` / ``transcribe_endpoint`` 據此提早記用量(見兩者對
+    ``_add_monthly_usage`` 的第一次呼叫),避免使用者短時間內連發請求都趕在
+    處理完成前通過配額檢查而超額。
+    """
+    out = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            audio_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return float(out.stdout.strip())
 
 
 def _fail(uid, track_id, code: str, message: str, http_status: int):
@@ -242,6 +276,21 @@ def align_endpoint():
         t_fetched - t0,
     )
 
+    # 音訊已下載、長度已知——不必等對齊跑完就先記一筆用量,關掉配額檢查與
+    # 實際扣量之間的空窗(同一使用者短時間連發多個請求,原本都會在對齊完成
+    # 前通過 `_monthly_quota_exceeded` 檢查而超額)。之後任何一步失敗,
+    # 在各自的失敗分支把這筆用量扣回。
+    duration_seconds = 0.0
+    usage_recorded = False
+    if uid and track_id:
+        try:
+            duration_seconds = _probe_duration_seconds(audio_path)
+        except Exception:
+            log.exception("量測音訊長度失敗(uid=%s trackId=%s)", uid, track_id)
+        if duration_seconds > 0:
+            _add_monthly_usage(str(uid), duration_seconds)
+            usage_recorded = True
+
     if uid and track_id:
         _write_status(str(uid), str(track_id), STATUS_ALIGNING)
 
@@ -254,17 +303,23 @@ def align_endpoint():
         log.warning(
             "對齊模型載入失敗(503,已耗時 %.1fs):%s", time.perf_counter() - t0, exc
         )
+        if usage_recorded:
+            _add_monthly_usage(str(uid), -duration_seconds)
         return _fail(uid, track_id, "align_model_unavailable", str(exc), 503)
     except AlignmentError as exc:
         log.warning("對齊失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
+        if usage_recorded:
+            _add_monthly_usage(str(uid), -duration_seconds)
         return _fail(uid, track_id, "alignment_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("對齊時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
+        if usage_recorded:
+            _add_monthly_usage(str(uid), -duration_seconds)
         return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
 
-    duration_seconds = result.pop("durationSeconds", 0.0)
+    result.pop("durationSeconds", None)
     log.info(
         "/align 完成 行數=%d lang=%s,對齊耗時 %.1fs(總計 %.1fs)",
         len(result.get("fragments") or []),
@@ -283,10 +338,11 @@ def align_endpoint():
             log.exception(
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
+            if usage_recorded:
+                _add_monthly_usage(str(uid), -duration_seconds)
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )
-        _add_monthly_usage(str(uid), duration_seconds)
 
     # 上傳到 GCS 的暫存音訊不在此即時刪除;清理交給 bucket lifecycle
     # (align/ 前綴定期刪),涵蓋成功與失敗路徑,後端只需讀取權限。
@@ -342,6 +398,21 @@ def transcribe_endpoint():
         t_fetched - t0,
     )
 
+    # 音訊已下載、長度已知——不必等轉寫跑完就先記一筆用量,關掉配額檢查與
+    # 實際扣量之間的空窗(同一使用者短時間連發多個請求,原本都會在轉寫完成
+    # 前通過 `_monthly_quota_exceeded` 檢查而超額)。之後任何一步失敗,
+    # 在各自的失敗分支把這筆用量扣回。
+    duration_seconds = 0.0
+    usage_recorded = False
+    if uid and track_id:
+        try:
+            duration_seconds = _probe_duration_seconds(audio_path)
+        except Exception:
+            log.exception("量測音訊長度失敗(uid=%s trackId=%s)", uid, track_id)
+        if duration_seconds > 0:
+            _add_monthly_usage(str(uid), duration_seconds)
+            usage_recorded = True
+
     if uid and track_id:
         _write_status(str(uid), str(track_id), STATUS_TRANSCRIBING)
 
@@ -351,14 +422,18 @@ def transcribe_endpoint():
         # 記下「可預期失敗」的原因(辨識不出歌詞 / 音訊不可用),否則 422
         # 在 log 無痕,難以判斷是音訊問題還是模型沒抓到歌聲。
         log.warning("轉寫失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
+        if usage_recorded:
+            _add_monthly_usage(str(uid), -duration_seconds)
         return _fail(uid, track_id, "transcription_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("轉寫時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
+        if usage_recorded:
+            _add_monthly_usage(str(uid), -duration_seconds)
         return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
 
-    duration_seconds = result.pop("durationSeconds", 0.0)
+    result.pop("durationSeconds", None)
     log.info(
         "/transcribe 完成 行數=%d lang=%s,轉寫耗時 %.1fs(總計 %.1fs)",
         len(result.get("fragments") or []),
@@ -377,10 +452,11 @@ def transcribe_endpoint():
             log.exception(
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
+            if usage_recorded:
+                _add_monthly_usage(str(uid), -duration_seconds)
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )
-        _add_monthly_usage(str(uid), duration_seconds)
 
     # 暫存音訊清理同 /align:交給 bucket lifecycle(generate/ 前綴定期刪)。
     return jsonify(result)
