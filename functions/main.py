@@ -7,7 +7,8 @@
   把工作丟進 Cloud Tasks,由佇列非同步呼叫 aeneas / WhisperX Cloud Run 服務;
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
   ``user/{uid}/lyrics/{trackId}``(不經 RPC 回傳歌詞內文)。若該 trackId 已有
-  產生過的快照,直接回應成功、不重跑。派工成功後在同一份文件寫入
+  產生過的快照,直接回應成功、不重跑,並把該文件 ``status`` 補成 ``"done"``。
+  派工成功後在同一份文件寫入
   ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
   ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
   讓 client 全程可從 Firestore 讀到進度。
@@ -176,13 +177,12 @@ def _task_in_progress(uid: str, track_id: str) -> bool:
     return (doc.to_dict() or {}).get("status") in _IN_PROGRESS_STATUSES
 
 
-def _write_queued_status(uid: str, track_id: str) -> None:
-    """把工作標記為已進佇列(``user/{uid}/lyrics/{trackId}.status = "queued"``),
-    讓 client 在收到 RPC 回應的當下就能顯示進度,不必等 Cloud Run 端點處理到
-    一半才第一次看到狀態。以 merge 寫入(該 trackId 可能還沒有 lyrics 文件、
-    或沿用舊快照的 content),並清掉上次失敗殘留的 ``error``。
+def _write_status(uid: str, track_id: str, status: str) -> None:
+    """以 merge 寫入 ``user/{uid}/lyrics/{trackId}.status``(附 ``statusUpdatedAt``),
+    並清掉上次失敗殘留的 ``error``。merge 是因為該 trackId 可能還沒有 lyrics
+    文件、或要沿用舊快照的 content / source。
 
-    只是進度提示,寫入失敗不影響已經派工成功的工作,故吞例外、只記 log。
+    只是進度提示,寫入失敗不影響 RPC 已回應的結果,故吞例外、只記 log。
     """
     db = firestore.client()
     doc_ref = (
@@ -194,14 +194,31 @@ def _write_queued_status(uid: str, track_id: str) -> None:
     try:
         doc_ref.set(
             {
-                "status": "queued",
+                "status": status,
                 "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "error": firestore.DELETE_FIELD,
             },
             merge=True,
         )
     except Exception:
-        log.exception("寫入 queued 狀態失敗(uid=%s trackId=%s)", uid, track_id)
+        log.exception(
+            "寫入 %s 狀態失敗(uid=%s trackId=%s)", status, uid, track_id
+        )
+
+
+def _write_queued_status(uid: str, track_id: str) -> None:
+    """把工作標記為已進佇列(``status = "queued"``),讓 client 在收到 RPC 回應
+    的當下就能顯示進度,不必等 Cloud Run 端點處理到一半才第一次看到狀態。
+    """
+    _write_status(uid, track_id, "queued")
+
+
+def _write_done_status(uid: str, track_id: str) -> None:
+    """命中既有快照、不派工時,把 ``status`` 補成 ``"done"``。舊快照的 status
+    可能是舊版寫入前根本沒有、或殘留上一次的 ``failed``;client 監聽 status
+    等終態的話會一直等不到,故在回 ``cached`` 前先把狀態收斂到 ``done``。
+    """
+    _write_status(uid, track_id, "done")
 
 
 def _enqueue_task(queue: str, url: str, audience: str, payload: dict) -> None:
@@ -253,7 +270,8 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意:
-        - 該 trackId 已有對時 / 產生過的快照 → ``{"saved": True, "cached": True}``。
+        - 該 trackId 已有對時 / 產生過的快照 → ``{"saved": True, "cached": True}``,
+          不派工、不扣配額,並把該文件的 ``status`` 補寫成 ``"done"``。
         - 否則派工成功 → ``{"saved": True, "queued": True}``,**此時歌詞尚未
           產生完成**,client 不應假設此刻已可讀到內容。
         - 驗證失敗 / 配額用盡 / 派工失敗以 HttpsError 回對應錯誤碼。
@@ -290,6 +308,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         )
 
     if _has_generated_snapshot(uid, str(track_id)):
+        _write_done_status(uid, str(track_id))
         return {"saved": True, "cached": True}
 
     if _task_in_progress(uid, str(track_id)):
@@ -384,6 +403,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         )
 
     if _has_generated_snapshot(uid, str(track_id)):
+        _write_done_status(uid, str(track_id))
         return {"saved": True, "cached": True}
 
     if _task_in_progress(uid, str(track_id)):

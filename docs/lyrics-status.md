@@ -17,7 +17,7 @@ user/{uid}/lyrics/{trackId}
 | `aligning` | `whisperx_service` / `aeneas_service` `/align` | 強制對齊中(已有歌詞文字,只補時間) |
 | `transcribing` | `whisperx_service` `/transcribe` | ASR 轉寫中(無歌詞文字,直接產生) |
 | `saving` | `whisperx_service` / `aeneas_service` | 結果組成 LRC,準備寫回 Firestore |
-| `done` | `whisperx_service` / `aeneas_service` | 完成。同一筆寫入一併帶上歌詞內容(見下方「done 的寫入內容」) |
+| `done` | `whisperx_service` / `aeneas_service`;`functions/main.py`(命中既有快照時) | 完成。Cloud Run 寫入時同一筆一併帶上歌詞內容(見下方「done 的寫入內容」);`functions/main.py` 命中既有快照時只補 `status`,不動內容 |
 | `failed` | `whisperx_service` / `aeneas_service` | 失敗。同時寫入 `error = <code>`,code 對照 `error-codes.md` |
 
 前端可把 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` 視為「進行中」,`done` / `failed` 視為終態。
@@ -63,13 +63,13 @@ queued → downloading_audio → transcribing → saving → done
 | `status` | `"done"` |
 | `statusUpdatedAt` | 毫秒 epoch(int) |
 
-其他狀態都是 `merge=True`,只動 `status` / `statusUpdatedAt` / `error`,**不會改變 `source`**。也就是處理期間 `source` 維持文件原有的值(例如使用者先前匯入的歌詞來源),只有成功到 `done` 時才變成 `generated`。
+其他狀態(以及 `functions/main.py` 命中既有快照時補寫的 `done`)都是 `merge=True`,只動 `status` / `statusUpdatedAt` / `error`,**不會改變 `source`**。也就是處理期間 `source` 維持文件原有的值(例如使用者先前匯入的歌詞來源),只有成功到 `done` 時才變成 `generated`。
 
 ## 後端如何使用這些狀態
 
 `functions/main.py` 在 `align_lyrics` / `generate_lyrics` 派工前依序檢查:
 
-1. **已有產物**:`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。
+1. **已有產物**:`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
 2. **進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。用來擋使用者短時間內連點。
 3. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
 4. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`。
@@ -87,6 +87,6 @@ queued → downloading_audio → transcribing → saving → done
 
 | 位置 | 內容 |
 |---|---|
-| `functions/main.py` `_IN_PROGRESS_STATUSES` | 5 個進行中狀態的集合;`_write_queued_status` 直接寫字串 `"queued"` |
+| `functions/main.py` `_IN_PROGRESS_STATUSES` | 5 個進行中狀態的集合;`_write_queued_status` / `_write_done_status` 經共用的 `_write_status` 寫字串 `"queued"` / `"done"` |
 | `whisperx_service/main.py` `STATUS_*` | 6 個常數(含 `TRANSCRIBING`) |
 | `aeneas_service/main.py` `STATUS_*` | 5 個常數(無 `TRANSCRIBING`) |
