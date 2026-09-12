@@ -3,7 +3,7 @@
 前端可依 `code` 做多語系翻譯對照
 
 - **同步 RPC**(`align_lyrics` / `generate_lyrics` 呼叫當下失敗):code 放在 `HttpsError.details.code`。
-- **非同步處理**(派工後,Cloud Run 服務跑完才知道成功或失敗):code 寫進 Firestore `users/{uid}/lyrics/{trackId}.error`,搭配 `status = "failed"`。
+- **非同步處理**(派工後,Cloud Run 服務跑完才知道成功或失敗):code 寫進 Firestore `users/{uid}/lyrics/{trackId}.error`,搭配 `status = "failed"`。狀態值一覽見 `lyrics-status.md`。
 
 ## 同步 RPC(`functions/main.py`)
 
