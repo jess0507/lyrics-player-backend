@@ -3,7 +3,7 @@
 前端可依 `code` 做多語系翻譯對照
 
 - **同步 RPC**(`align_lyrics` / `generate_lyrics` 呼叫當下失敗):code 放在 `HttpsError.details.code`。
-- **非同步處理**(派工後,Cloud Run 服務跑完才知道成功或失敗):code 寫進 Firestore `users/{uid}/lyrics/{trackId}.error`,搭配 `status = "failed"`。狀態值一覽見 `lyrics-status.md`。
+- **非同步處理**(派工後,Cloud Run 服務跑完才知道成功或失敗):code 寫進 Firestore `users/{uid}/lyrics/{jobId}.error`,搭配 `status = "failed"`。狀態值一覽見 `lyrics-status.md`。
 
 ## 同步 RPC(`functions/main.py`)
 
@@ -12,13 +12,14 @@
 | code | 觸發時機 | Firebase `error.code` |
 |---|---|---|
 | `service_unavailable` | 對應的 Cloud Run 服務未設定(缺 `ALIGN_SERVICE_URL` / `WHISPERX_SERVICE_URL`) | `internal` |
-| `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `trackId`) | `invalid-argument` |
+| `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `jobId`(舊版 client 為 `trackId`)) | `invalid-argument` |
+| `busy` | 同一個任務(同任務種類、同 `fingerprint`)仍在處理中;`details.activeTitle` 為曲名 | `failed-precondition` |
 | `quota_exceeded` | 本月額度(對時 + 自動產生合併計算,預設 60 分鐘)已用盡 | `resource-exhausted` |
 | `dispatch_failed` | 派工到 Cloud Tasks 失敗 | `internal` |
 
 ## 非同步處理(`whisperx_service/main.py` / `aeneas_service/main.py`)
 
-Cloud Run 服務處理失敗時,寫入 `users/{uid}/lyrics/{trackId}`:`status = "failed"`、`error = <code>`。前端應以 Firestore 上的最新值為準(Cloud Tasks 重試可能覆寫回較早的狀態)。
+Cloud Run 服務處理失敗時,寫入 `users/{uid}/lyrics/{jobId}`:`status = "failed"`、`error = <code>`。前端應以 Firestore 上的最新值為準(Cloud Tasks 重試可能覆寫回較早的狀態)。
 
 | code | 觸發時機 | 服務 |
 |---|---|---|

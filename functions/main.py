@@ -6,8 +6,11 @@
 - ``align_lyrics`` / ``generate_lyrics``:歌詞自動對時 / 自動產生——驗證 + 配額後,
   把工作丟進 Cloud Tasks,由佇列非同步呼叫 aeneas / WhisperX Cloud Run 服務;
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
-  ``user/{uid}/lyrics/{trackId}``(不經 RPC 回傳歌詞內文)。若該 trackId 已有
-  產生過的快照,直接回應成功、不重跑,並把該文件 ``status`` 補成 ``"done"``。
+  ``user/{uid}/lyrics/{jobId}``(不經 RPC 回傳歌詞內文)。jobId 由 client 每次
+  送出時產生(舊版 client 以 ``trackId`` 參數傳入曲目指紋,同樣當文件 id 用)。
+  client 另帶音檔內容指紋 ``fingerprint`` 時,先查同一首歌是否處理過
+  (見 ``_lookup_cached_job``):同任務種類、同指紋且上次處理成功,就複製到
+  這次的 jobId 文件並回應成功、不重跑;同一個任務還在處理中則回 busy。
   派工成功後在同一份文件寫入
   ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
   ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
@@ -19,6 +22,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from firebase_admin import auth, firestore, initialize_app
@@ -84,6 +88,116 @@ def _require_uid(req: https_fn.CallableRequest) -> str:
             message="必須登入才能執行此操作。",
         )
     return req.auth.uid
+
+
+# ---- 依音檔內容指紋沿用既有結果 ----
+#
+# client 每次送出都用新的 jobId 當任務文件 id,文件 id 不再代表曲目,無法再以
+# 「同一份文件已有結果」判斷是否處理過。改由 client 附上音檔內容指紋
+# ``fingerprint``(``sha1("{size}:" + 頭 64KB + 尾 64KB)``,與舊版 trackId 同一套
+# 演算法),本 Function 在 ``user/{uid}/lyricsCache/{cacheKey}`` 記下「這個
+# 任務種類 + 指紋最後一次派工的 jobId」,下次同一個任務先查這裡;只有上次
+# 處理成功(``status == "done"``)才沿用。
+#
+# 索引放在獨立子集合、只由本 Function 寫入:Cloud Run 存結果時以 ``set()``
+# 整份覆寫 lyrics 文件,欄位放在 lyrics 文件裡會被蓋掉。
+
+_CACHE_COLLECTION = "lyricsCache"
+
+# 任務卡在處理中狀態超過這麼久(Cloud Run 中途掛掉等)視為失效,不再擋新派工。
+_STALE_IN_PROGRESS_MS = 30 * 60 * 1000
+
+_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _user_doc(uid: str):
+    return firestore.client().collection("user").document(uid)
+
+
+def _cache_key(kind: str, fingerprint) -> str | None:
+    """沿用結果的索引 key:任務種類(``generate`` / ``align``)+ 指紋,兩者都
+    相同才算同一個任務;``fingerprint`` 不合法(舊版 client 沒帶)回 None。
+    """
+    if not isinstance(fingerprint, str) or not _FINGERPRINT_PATTERN.match(fingerprint):
+        return None
+    return f"{kind}_{fingerprint}"
+
+
+def _lookup_cached_job(uid: str, cache_key: str):
+    """查同一個任務(同 cache key)上次派工的結果。
+
+    回傳 ``("done", data)``:上次**處理成功**(``status == "done"`` 且有內文),
+    可沿用;``("busy", data)``:仍在處理中;``None``:沒有紀錄,或上次失敗 /
+    卡住失效——照常派工(派工後索引改指向新的 jobId,不會蓋掉成功的紀錄:
+    有成功的紀錄早在這裡就回 done 了)。
+    """
+    user = _user_doc(uid)
+    index = user.collection(_CACHE_COLLECTION).document(cache_key).get()
+    job_id = (index.to_dict() or {}).get("jobId") if index.exists else None
+    if not job_id:
+        return None
+    snapshot = user.collection("lyrics").document(str(job_id)).get()
+    if not snapshot.exists:
+        return None
+    data = snapshot.to_dict() or {}
+    status = data.get("status")
+    if status == "done" and data.get("content"):
+        return ("done", data)
+    updated_at = data.get("statusUpdatedAt") or 0
+    if (
+        status in _IN_PROGRESS_STATUSES
+        and _now_ms() - int(updated_at) < _STALE_IN_PROGRESS_MS
+    ):
+        return ("busy", data)
+    return None
+
+
+def _apply_cache(uid: str, job_id: str, cache_key: str | None, title) -> bool:
+    """命中既有結果時複製到這次的任務文件並回 True(呼叫端直接回應 cached);
+    同一首歌仍在處理中則丟 busy;沒有紀錄回 False(照常派工)。"""
+    if cache_key is None:
+        return False
+    found = _lookup_cached_job(uid, cache_key)
+    if found is None:
+        return False
+    state, data = found
+    if state == "busy":
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message="這首歌正在處理中,請稍後再試。",
+            details={"code": "busy", "activeTitle": title or data.get("title") or ""},
+        )
+    now = _now_ms()
+    # 與 Cloud Run 的 _save_lyrics_snapshot 同一份 schema,client 監聽到 done
+    # 即照常存回本機。
+    _user_doc(uid).collection("lyrics").document(job_id).set(
+        {
+            "title": title or data.get("title") or "",
+            "format": data.get("format") or "lrc",
+            "source": "generated",
+            "content": data["content"],
+            "addedAt": now,
+            "status": "done",
+            "statusUpdatedAt": now,
+        }
+    )
+    return True
+
+
+def _remember_job(uid: str, cache_key: str | None, job_id: str) -> None:
+    """派工成功後記下這個 cache key 最新的 jobId。只是加速下次查詢,失敗只記 log。"""
+    if cache_key is None:
+        return
+    try:
+        _user_doc(uid).collection(_CACHE_COLLECTION).document(cache_key).set(
+            {"jobId": job_id, "createdAt": _now_ms()}
+        )
+    except Exception:
+        log.exception("寫入 lyricsCache 失敗(uid=%s key=%s)", uid, cache_key)
 
 
 def _delete_user_data(uid: str) -> None:
@@ -256,7 +370,7 @@ def _enqueue_task(queue: str, url: str, audience: str, payload: dict) -> None:
 def align_lyrics(req: https_fn.CallableRequest) -> dict:
     """歌詞自動對時:驗證 + 配額後,把工作丟進 Cloud Tasks 非同步轉呼 aeneas /
     WhisperX Cloud Run 的 ``/align``,**立刻回應、不等對時完成**。對時結果由
-    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{trackId}``
+    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{jobId}``
     (不經本 RPC 回傳歌詞內文)。
 
     Request data:
@@ -265,13 +379,19 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``object``: str,音訊物件路徑(App 先壓縮後上傳)。
         - ``language``: str(選填),語言碼,預設 ``eng``。
         - ``format``: str(選填),音訊副檔名提示。
-        - ``trackId``: str,曲目 id(內容指紋);結果的存放位置
-          (``user/{uid}/lyrics/{trackId}``),必填。
+        - ``jobId``: str,這次任務的文件 id;結果存在
+          ``user/{uid}/lyrics/{jobId}``。新版 client 必帶。
+        - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
+          文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
+        - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
+          查同一首歌是否處理過(見 ``_lookup_cached_job``)。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意:
-        - 該 trackId 已有對時 / 產生過的快照 → ``{"saved": True, "cached": True}``,
-          不派工、不扣配額,並把該文件的 ``status`` 補寫成 ``"done"``。
+        - 同一個任務(同任務種類、同指紋)上次處理成功 → 複製到這次的任務文件
+          (``status = "done"``)並回 ``{"saved": True, "cached": True}``,
+          不派工、不扣配額;舊版 client 則看任務文件本身是否已有快照。
+        - 同一首歌仍在處理中 → ``failed-precondition``(``details.code = "busy"``)。
         - 否則派工成功 → ``{"saved": True, "queued": True}``,**此時歌詞尚未
           產生完成**,client 不應假設此刻已可讀到內容。
         - 驗證失敗 / 配額用盡 / 派工失敗以 HttpsError 回對應錯誤碼。
@@ -284,7 +404,9 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     obj = data.get("object")
     language = data.get("language") or "eng"
     audio_format = data.get("format")
-    track_id = data.get("trackId")
+    # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
+    track_id = data.get("jobId") or data.get("trackId")
+    fingerprint = data.get("fingerprint")
     title = data.get("title")
     engine = data.get("engine") or "aeneas"
     service_url = _service_url_for(engine)
@@ -303,7 +425,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     ):
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message="缺少 lines / bucket / object / trackId。",
+            message="缺少 lines / bucket / object / jobId。",
             details={"code": "invalid_request"},
         )
 
@@ -313,6 +435,10 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
 
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
+
+    cache_key = _cache_key("align", fingerprint)
+    if _apply_cache(uid, str(track_id), cache_key, title):
+        return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
         raise https_fn.HttpsError(
@@ -350,6 +476,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         )
 
     _write_queued_status(uid, str(track_id))
+    _remember_job(uid, cache_key, str(track_id))
     return {"saved": True, "queued": True}
 
 
@@ -361,7 +488,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
 def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     """歌詞自動產生:驗證 + 配額後,把工作丟進 Cloud Tasks 非同步轉呼
     WhisperX Cloud Run 的 ``/transcribe``,**立刻回應、不等轉寫完成**。結果由
-    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{trackId}``
+    Cloud Run 端點自行存入 Firestore ``user/{uid}/lyrics/{jobId}``
     (不經本 RPC 回傳歌詞內文)。
 
     與 ``align_lyrics`` 的差別:**沒有既有文字**(不需 ``lines``),由後端 ASR
@@ -372,8 +499,12 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``object``: str,音訊物件路徑(App 先壓縮後上傳,慣例前綴 ``generate/``)。
         - ``language``: str(選填),語言提示;省略則後端自動偵測。
         - ``format``: str(選填),音訊副檔名提示。
-        - ``trackId``: str,曲目 id(內容指紋);結果的存放位置
-          (``user/{uid}/lyrics/{trackId}``),必填。
+        - ``jobId``: str,這次任務的文件 id;結果存在
+          ``user/{uid}/lyrics/{jobId}``。新版 client 必帶。
+        - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
+          文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
+        - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
+          查同一首歌是否處理過(見 ``_lookup_cached_job``)。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意同 ``align_lyrics``:``{"saved": True, "cached": True}`` 或
@@ -386,7 +517,9 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     obj = data.get("object")
     language = data.get("language")  # 選填:省略 → 後端自動偵測語言。
     audio_format = data.get("format")
-    track_id = data.get("trackId")
+    # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
+    track_id = data.get("jobId") or data.get("trackId")
+    fingerprint = data.get("fingerprint")
     title = data.get("title")
 
     if not _WHISPERX_SERVICE_URL:
@@ -398,7 +531,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     if not bucket or not obj or not track_id:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message="缺少 bucket / object / trackId。",
+            message="缺少 bucket / object / jobId。",
             details={"code": "invalid_request"},
         )
 
@@ -408,6 +541,10 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
 
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
+
+    cache_key = _cache_key("generate", fingerprint)
+    if _apply_cache(uid, str(track_id), cache_key, title):
+        return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
         raise https_fn.HttpsError(
@@ -445,4 +582,5 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         )
 
     _write_queued_status(uid, str(track_id))
+    _remember_job(uid, cache_key, str(track_id))
     return {"saved": True, "queued": True}

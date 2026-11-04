@@ -3,10 +3,10 @@
 歌詞製作(對時 `align_lyrics` / 自動產生 `generate_lyrics`)是非同步流程:callable function 派工到 Cloud Tasks 後立刻回應,實際處理由 Cloud Run 服務在背景執行。前端唯一能觀察進度的地方是 Firestore 文件
 
 ```
-user/{uid}/lyrics/{trackId}
+user/{uid}/lyrics/{jobId}
 ```
 
-上的 `status` 欄位。本文列出所有狀態值、寫入者與流程順序。錯誤碼見 `error-codes.md`。
+上的 `status` 欄位。`jobId` 由 client 每次送出時產生(callable 參數 `jobId`;舊版 client 只帶 `trackId` 曲目指紋,同樣當文件 id 用),所以一份文件就是一次任務。本文列出所有狀態值、寫入者與流程順序。錯誤碼見 `error-codes.md`。
 
 ## 狀態一覽
 
@@ -17,7 +17,7 @@ user/{uid}/lyrics/{trackId}
 | `aligning` | `whisperx_service` / `aeneas_service` `/align` | 強制對齊中(已有歌詞文字,只補時間) |
 | `transcribing` | `whisperx_service` `/transcribe` | ASR 轉寫中(無歌詞文字,直接產生) |
 | `saving` | `whisperx_service` / `aeneas_service` | 結果組成 LRC,準備寫回 Firestore |
-| `done` | `whisperx_service` / `aeneas_service`;`functions/main.py`(命中既有快照時) | 完成。Cloud Run 寫入時同一筆一併帶上歌詞內容(見下方「done 的寫入內容」);`functions/main.py` 命中既有快照時只補 `status`,不動內容 |
+| `done` | `whisperx_service` / `aeneas_service`;`functions/main.py`(命中既有結果時) | 完成。Cloud Run 寫入時同一筆一併帶上歌詞內容(見下方「done 的寫入內容」);`functions/main.py` 依指紋命中時把舊結果整份複製進這次的任務文件,舊版 client 命中同一份文件時只補 `status` |
 | `failed` | `whisperx_service` / `aeneas_service` | 失敗。同時寫入 `error = <code>`,code 對照 `error-codes.md` |
 
 前端可把 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` 視為「進行中」,`done` / `failed` 視為終態。
@@ -69,10 +69,24 @@ queued → downloading_audio → transcribing → saving → done
 
 `functions/main.py` 在 `align_lyrics` / `generate_lyrics` 派工前依序檢查:
 
-1. **已有產物**:`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
-2. **進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。用來擋使用者短時間內連點。
-3. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
-4. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`。
+1. **任務文件本身已有產物**(舊版 client 以曲目指紋為文件 id 時才會命中):`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
+2. **任務文件本身進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。
+3. **依任務種類 + 指紋沿用**(client 有帶 `fingerprint` 時):查 `user/{uid}/lyricsCache/{cacheKey}` 記錄的上一次 jobId,讀那份任務文件:
+   - 上次**處理成功**(`status == "done"` 且 `content` 非空)→ 以非 merge 的 `set` 把 `title` / `format` / `source` / `content` 複製到這次的任務文件並寫 `status = "done"`,回 `{"saved": true, "cached": true}`,不派工、不扣配額。
+   - 仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
+   - 上次失敗、卡住超過 30 分鐘、或沒有紀錄 → 照常派工。
+4. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
+5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`,並把 jobId 記進 `lyricsCache/{cacheKey}`。
+
+### `lyricsCache` 索引
+
+| 欄位 | 說明 |
+|---|---|
+| 文件 id | `{任務種類}_{fingerprint}`,即 `generate_{fingerprint}` / `align_{fingerprint}`;任務種類與指紋都相同才算同一個任務 |
+| `jobId` | 該 key 最後一次派工的任務文件 id。有成功的紀錄時會直接沿用、不再派工,所以只有上次失敗 / 卡住 / 沒有紀錄時才會被新的 jobId 覆蓋 |
+| `createdAt` | 毫秒 epoch(int) |
+
+只由 `functions/main.py` 寫入。不放在 `lyrics/{jobId}` 文件裡,是因為 Cloud Run 寫 `done` 時以非 merge 的 `set` 整份覆寫,額外欄位會被蓋掉。`fingerprint` 為 `sha1("{size}:" + 頭 64KB + 尾 64KB)` 的 40 碼 hex(與舊版 trackId 同一套演算法)。
 
 ## 注意事項
 
