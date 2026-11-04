@@ -8,9 +8,10 @@
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
   ``user/{uid}/lyrics/{jobId}``(不經 RPC 回傳歌詞內文)。jobId 由 client 每次
   送出時產生(舊版 client 以 ``trackId`` 參數傳入曲目指紋,同樣當文件 id 用)。
-  client 另帶音檔內容指紋 ``fingerprint`` 時,先查同一首歌是否處理過
-  (見 ``_lookup_cached_job``):同任務種類、同指紋且上次處理成功,就複製到
-  這次的 jobId 文件並回應成功、不重跑;同一個任務還在處理中則回 busy。
+  client 另帶音檔內容指紋 ``fingerprint`` 時,先 query 任務文件比對同任務
+  種類(``kind``)、同指紋且處理成功的結果(見 ``_reuse_succeeded_task``):
+  有就複製到這次的 jobId 文件並回應成功、不重跑;同一個任務還在處理中則
+  回 busy。
   派工成功後在同一份文件寫入
   ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
   ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
@@ -28,6 +29,7 @@ from datetime import datetime, timezone
 from firebase_admin import auth, firestore, initialize_app
 from firebase_functions import https_fn, options
 from google.cloud import tasks_v2
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 initialize_app()
 
@@ -90,19 +92,17 @@ def _require_uid(req: https_fn.CallableRequest) -> str:
     return req.auth.uid
 
 
-# ---- 依音檔內容指紋沿用既有結果 ----
+# ---- 依任務種類 + 音檔內容指紋沿用既有結果 ----
 #
 # client 每次送出都用新的 jobId 當任務文件 id,文件 id 不再代表曲目,無法再以
 # 「同一份文件已有結果」判斷是否處理過。改由 client 附上音檔內容指紋
 # ``fingerprint``(``sha1("{size}:" + 頭 64KB + 尾 64KB)``,與舊版 trackId 同一套
-# 演算法),本 Function 在 ``user/{uid}/lyricsCache/{cacheKey}`` 記下「這個
-# 任務種類 + 指紋最後一次派工的 jobId」,下次同一個任務先查這裡;只有上次
-# 處理成功(``status == "done"``)才沿用。
-#
-# 索引放在獨立子集合、只由本 Function 寫入:Cloud Run 存結果時以 ``set()``
-# 整份覆寫 lyrics 文件,欄位放在 lyrics 文件裡會被蓋掉。
+# 演算法);派工時把 ``fingerprint`` 與任務種類 ``kind``(``generate`` /
+# ``align``)寫進任務文件,下次同一個任務直接 query 任務文件比對。
+# Cloud Run 存結果時以 merge 寫入,這兩個欄位會一直保留在文件上。
 
-_CACHE_COLLECTION = "lyricsCache"
+_KIND_GENERATE = "generate"
+_KIND_ALIGN = "align"
 
 # 任務卡在處理中狀態超過這麼久(Cloud Run 中途掛掉等)視為失效,不再擋新派工。
 _STALE_IN_PROGRESS_MS = 30 * 60 * 1000
@@ -114,90 +114,86 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
-def _user_doc(uid: str):
-    return firestore.client().collection("user").document(uid)
+def _lyrics_collection(uid: str):
+    return firestore.client().collection("user").document(uid).collection("lyrics")
 
 
-def _cache_key(kind: str, fingerprint) -> str | None:
-    """沿用結果的索引 key:任務種類(``generate`` / ``align``)+ 指紋,兩者都
-    相同才算同一個任務;``fingerprint`` 不合法(舊版 client 沒帶)回 None。
-    """
-    if not isinstance(fingerprint, str) or not _FINGERPRINT_PATTERN.match(fingerprint):
-        return None
-    return f"{kind}_{fingerprint}"
-
-
-def _lookup_cached_job(uid: str, cache_key: str):
-    """查同一個任務(同 cache key)上次派工的結果。
-
-    回傳 ``("done", data)``:上次**處理成功**(``status == "done"`` 且有內文),
-    可沿用;``("busy", data)``:仍在處理中;``None``:沒有紀錄,或上次失敗 /
-    卡住失效——照常派工(派工後索引改指向新的 jobId,不會蓋掉成功的紀錄:
-    有成功的紀錄早在這裡就回 done 了)。
-    """
-    user = _user_doc(uid)
-    index = user.collection(_CACHE_COLLECTION).document(cache_key).get()
-    job_id = (index.to_dict() or {}).get("jobId") if index.exists else None
-    if not job_id:
-        return None
-    snapshot = user.collection("lyrics").document(str(job_id)).get()
-    if not snapshot.exists:
-        return None
-    data = snapshot.to_dict() or {}
-    status = data.get("status")
-    if status == "done" and data.get("content"):
-        return ("done", data)
-    updated_at = data.get("statusUpdatedAt") or 0
-    if (
-        status in _IN_PROGRESS_STATUSES
-        and _now_ms() - int(updated_at) < _STALE_IN_PROGRESS_MS
-    ):
-        return ("busy", data)
+def _valid_fingerprint(fingerprint) -> str | None:
+    """合法的 40 碼 sha1 hex 才回傳;舊版 client 沒帶或格式不符回 None。"""
+    if isinstance(fingerprint, str) and _FINGERPRINT_PATTERN.match(fingerprint):
+        return fingerprint
     return None
 
 
-def _apply_cache(uid: str, job_id: str, cache_key: str | None, title) -> bool:
-    """命中既有結果時複製到這次的任務文件並回 True(呼叫端直接回應 cached);
-    同一首歌仍在處理中則丟 busy;沒有紀錄回 False(照常派工)。"""
-    if cache_key is None:
+def _same_task_query(uid: str, kind: str, fingerprint: str):
+    """同任務種類、同指紋的任務文件。"""
+    return (
+        _lyrics_collection(uid)
+        .where(filter=FieldFilter("fingerprint", "==", fingerprint))
+        .where(filter=FieldFilter("kind", "==", kind))
+    )
+
+
+def _find_succeeded_task(uid: str, kind: str, fingerprint: str) -> dict | None:
+    """同一個任務曾**處理成功**(``status == "done"`` 且有內文)的結果。"""
+    query = _same_task_query(uid, kind, fingerprint).where(
+        filter=FieldFilter("status", "==", "done")
+    )
+    for snapshot in query.limit(5).stream():
+        data = snapshot.to_dict() or {}
+        if data.get("content"):
+            return data
+    return None
+
+
+def _find_running_task(uid: str, kind: str, fingerprint: str) -> dict | None:
+    """同一個任務仍在處理中(30 分鐘內有更新)的文件。"""
+    query = _same_task_query(uid, kind, fingerprint).where(
+        filter=FieldFilter("status", "in", sorted(_IN_PROGRESS_STATUSES))
+    )
+    now = _now_ms()
+    for snapshot in query.stream():
+        data = snapshot.to_dict() or {}
+        if now - int(data.get("statusUpdatedAt") or 0) < _STALE_IN_PROGRESS_MS:
+            return data
+    return None
+
+
+def _reuse_succeeded_task(
+    uid: str, job_id: str, kind: str, fingerprint: str | None, title
+) -> bool:
+    """同任務種類、同指紋且曾處理成功:把結果複製到這次的任務文件並回 True
+    (呼叫端直接回應 cached);同一個任務仍在處理中則丟 busy;其餘回 False
+    (照常派工)。沒帶指紋(舊版 client)一律回 False。"""
+    if fingerprint is None:
         return False
-    found = _lookup_cached_job(uid, cache_key)
-    if found is None:
-        return False
-    state, data = found
-    if state == "busy":
+    succeeded = _find_succeeded_task(uid, kind, fingerprint)
+    if succeeded is not None:
+        now = _now_ms()
+        # 與 Cloud Run 的 _save_lyrics_snapshot 同一份 schema,client 監聽到
+        # done 即照常存回本機;fingerprint / kind 一併寫入,這份也能再被沿用。
+        _lyrics_collection(uid).document(job_id).set(
+            {
+                "title": title or succeeded.get("title") or "",
+                "format": succeeded.get("format") or "lrc",
+                "source": "generated",
+                "content": succeeded["content"],
+                "addedAt": now,
+                "status": "done",
+                "statusUpdatedAt": now,
+                "fingerprint": fingerprint,
+                "kind": kind,
+            }
+        )
+        return True
+    running = _find_running_task(uid, kind, fingerprint)
+    if running is not None:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
             message="這首歌正在處理中,請稍後再試。",
-            details={"code": "busy", "activeTitle": title or data.get("title") or ""},
+            details={"code": "busy", "activeTitle": title or running.get("title") or ""},
         )
-    now = _now_ms()
-    # 與 Cloud Run 的 _save_lyrics_snapshot 同一份 schema,client 監聽到 done
-    # 即照常存回本機。
-    _user_doc(uid).collection("lyrics").document(job_id).set(
-        {
-            "title": title or data.get("title") or "",
-            "format": data.get("format") or "lrc",
-            "source": "generated",
-            "content": data["content"],
-            "addedAt": now,
-            "status": "done",
-            "statusUpdatedAt": now,
-        }
-    )
-    return True
-
-
-def _remember_job(uid: str, cache_key: str | None, job_id: str) -> None:
-    """派工成功後記下這個 cache key 最新的 jobId。只是加速下次查詢,失敗只記 log。"""
-    if cache_key is None:
-        return
-    try:
-        _user_doc(uid).collection(_CACHE_COLLECTION).document(cache_key).set(
-            {"jobId": job_id, "createdAt": _now_ms()}
-        )
-    except Exception:
-        log.exception("寫入 lyricsCache 失敗(uid=%s key=%s)", uid, cache_key)
+    return False
 
 
 def _delete_user_data(uid: str) -> None:
@@ -291,7 +287,7 @@ def _task_in_progress(uid: str, track_id: str) -> bool:
     return (doc.to_dict() or {}).get("status") in _IN_PROGRESS_STATUSES
 
 
-def _write_status(uid: str, track_id: str, status: str) -> None:
+def _write_status(uid: str, track_id: str, status: str, extra: dict | None = None) -> None:
     """以 merge 寫入 ``user/{uid}/lyrics/{trackId}.status``(附 ``statusUpdatedAt``),
     並清掉上次失敗殘留的 ``error``。merge 是因為該 trackId 可能還沒有 lyrics
     文件、或要沿用舊快照的 content / source。
@@ -311,6 +307,7 @@ def _write_status(uid: str, track_id: str, status: str) -> None:
                 "status": status,
                 "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "error": firestore.DELETE_FIELD,
+                **(extra or {}),
             },
             merge=True,
         )
@@ -320,11 +317,15 @@ def _write_status(uid: str, track_id: str, status: str) -> None:
         )
 
 
-def _write_queued_status(uid: str, track_id: str) -> None:
+def _write_queued_status(
+    uid: str, track_id: str, kind: str, fingerprint: str | None
+) -> None:
     """把工作標記為已進佇列(``status = "queued"``),讓 client 在收到 RPC 回應
     的當下就能顯示進度,不必等 Cloud Run 端點處理到一半才第一次看到狀態。
+    有指紋時一併寫入 ``fingerprint`` / ``kind``,供之後同一個任務比對沿用。
     """
-    _write_status(uid, track_id, "queued")
+    extra = {"fingerprint": fingerprint, "kind": kind} if fingerprint else None
+    _write_status(uid, track_id, "queued", extra)
 
 
 def _write_done_status(uid: str, track_id: str) -> None:
@@ -384,7 +385,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
           文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
         - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
-          查同一首歌是否處理過(見 ``_lookup_cached_job``)。
+          查同一個任務是否處理成功過(見 ``_reuse_succeeded_task``)。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意:
@@ -406,7 +407,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     audio_format = data.get("format")
     # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
     track_id = data.get("jobId") or data.get("trackId")
-    fingerprint = data.get("fingerprint")
+    fingerprint = _valid_fingerprint(data.get("fingerprint"))
     title = data.get("title")
     engine = data.get("engine") or "aeneas"
     service_url = _service_url_for(engine)
@@ -436,8 +437,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
 
-    cache_key = _cache_key("align", fingerprint)
-    if _apply_cache(uid, str(track_id), cache_key, title):
+    if _reuse_succeeded_task(uid, str(track_id), _KIND_ALIGN, fingerprint, title):
         return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
@@ -475,8 +475,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "dispatch_failed"},
         )
 
-    _write_queued_status(uid, str(track_id))
-    _remember_job(uid, cache_key, str(track_id))
+    _write_queued_status(uid, str(track_id), _KIND_ALIGN, fingerprint)
     return {"saved": True, "queued": True}
 
 
@@ -504,7 +503,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
           文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
         - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
-          查同一首歌是否處理過(見 ``_lookup_cached_job``)。
+          查同一個任務是否處理成功過(見 ``_reuse_succeeded_task``)。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意同 ``align_lyrics``:``{"saved": True, "cached": True}`` 或
@@ -519,7 +518,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     audio_format = data.get("format")
     # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
     track_id = data.get("jobId") or data.get("trackId")
-    fingerprint = data.get("fingerprint")
+    fingerprint = _valid_fingerprint(data.get("fingerprint"))
     title = data.get("title")
 
     if not _WHISPERX_SERVICE_URL:
@@ -542,8 +541,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
 
-    cache_key = _cache_key("generate", fingerprint)
-    if _apply_cache(uid, str(track_id), cache_key, title):
+    if _reuse_succeeded_task(uid, str(track_id), _KIND_GENERATE, fingerprint, title):
         return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
@@ -581,6 +579,5 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "dispatch_failed"},
         )
 
-    _write_queued_status(uid, str(track_id))
-    _remember_job(uid, cache_key, str(track_id))
+    _write_queued_status(uid, str(track_id), _KIND_GENERATE, fingerprint)
     return {"saved": True, "queued": True}

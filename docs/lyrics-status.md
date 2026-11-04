@@ -51,7 +51,7 @@ queued → downloading_audio → transcribing → saving → done
 
 ### `done` 的寫入內容
 
-`done` 不是單獨更新 `status`,而是跟歌詞快照一起用 **非 merge 的 `set`** 整份覆寫文件,欄位與 App 端 sync v5 的 `LyricsEntity` schema 一致:
+`done` 不是單獨更新 `status`,而是跟歌詞快照一起以 **merge** 寫入(保留派工時寫入的 `fingerprint` / `kind`,並清掉 `error`),欄位與 App 端 sync v5 的 `LyricsEntity` schema 一致:
 
 | 欄位 | 值 |
 |---|---|
@@ -71,22 +71,23 @@ queued → downloading_audio → transcribing → saving → done
 
 1. **任務文件本身已有產物**(舊版 client 以曲目指紋為文件 id 時才會命中):`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
 2. **任務文件本身進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。
-3. **依任務種類 + 指紋沿用**(client 有帶 `fingerprint` 時):查 `user/{uid}/lyricsCache/{cacheKey}` 記錄的上一次 jobId,讀那份任務文件:
-   - 上次**處理成功**(`status == "done"` 且 `content` 非空)→ 以非 merge 的 `set` 把 `title` / `format` / `source` / `content` 複製到這次的任務文件並寫 `status = "done"`,回 `{"saved": true, "cached": true}`,不派工、不扣配額。
-   - 仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
-   - 上次失敗、卡住超過 30 分鐘、或沒有紀錄 → 照常派工。
+3. **依任務種類 + 指紋沿用**(client 有帶 `fingerprint` 時):直接 query `user/{uid}/lyrics` 裡 `fingerprint == 指紋` 且 `kind == 任務種類` 的任務文件:
+   - 有一份 `status == "done"` 且 `content` 非空(**處理成功過**)→ 把 `title` / `format` / `source` / `content` 複製到這次的任務文件(同時寫入 `fingerprint` / `kind`、`status = "done"`),回 `{"saved": true, "cached": true}`,不派工、不扣配額。
+   - 有一份仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
+   - 其餘(沒有紀錄、都失敗或卡住)→ 照常派工。
 4. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
-5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`,並把 jobId 記進 `lyricsCache/{cacheKey}`。
+5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`(有指紋時一併寫入 `fingerprint` / `kind`)。
 
-### `lyricsCache` 索引
+每個 jobId 文件都是一個獨立的任務;沒有另外的快取集合,沿用時比對的就是任務文件本身的欄位。
 
-| 欄位 | 說明 |
-|---|---|
-| 文件 id | `{任務種類}_{fingerprint}`,即 `generate_{fingerprint}` / `align_{fingerprint}`;任務種類與指紋都相同才算同一個任務 |
-| `jobId` | 該 key 最後一次派工的任務文件 id。有成功的紀錄時會直接沿用、不再派工,所以只有上次失敗 / 卡住 / 沒有紀錄時才會被新的 jobId 覆蓋 |
-| `createdAt` | 毫秒 epoch(int) |
+### 比對用的欄位
 
-只由 `functions/main.py` 寫入。不放在 `lyrics/{jobId}` 文件裡,是因為 Cloud Run 寫 `done` 時以非 merge 的 `set` 整份覆寫,額外欄位會被蓋掉。`fingerprint` 為 `sha1("{size}:" + 頭 64KB + 尾 64KB)` 的 40 碼 hex(與舊版 trackId 同一套演算法)。
+| 欄位 | 寫入者 | 說明 |
+|---|---|---|
+| `fingerprint` | `functions/main.py`(派工 / 沿用時) | 音檔內容指紋 `sha1("{size}:" + 頭 64KB + 尾 64KB)` 的 40 碼 hex(與舊版 trackId 同一套演算法);舊版 client 沒帶就不寫 |
+| `kind` | `functions/main.py`(派工 / 沿用時) | 任務種類 `generate` / `align` |
+
+Cloud Run 存結果(`done`)與更新狀態都以 merge 寫入,這兩個欄位會一直留在任務文件上。進行中的查詢用到 `status in [...]` 搭配兩個等值條件,若 Firestore 回報需要 composite index,依錯誤訊息裡的連結建立即可。
 
 ## 注意事項
 
