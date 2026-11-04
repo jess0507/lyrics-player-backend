@@ -5,6 +5,14 @@
 # 互相獨立,版本差異不影響。
 FROM python:3.8-slim-bullseye
 
+# Debian 11(bullseye)已結束支援,套件(先是 bullseye-security)陸續從
+# deb.debian.org 移到 archive.debian.org,原來源會 404。apt 來源一律改指
+# archive;封存的 Release 檔已過期,需關掉 Valid-Until 檢查。
+RUN find /etc/apt -name '*.list' -o -name '*.sources' | xargs sed -i \
+        -e 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' \
+        -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+    && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+
 # 系統依賴:espeak(g2p)、ffmpeg(音訊解碼)、build-essential(編 aeneas C 擴充)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         espeak \
