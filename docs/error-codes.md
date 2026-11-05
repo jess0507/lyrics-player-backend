@@ -12,8 +12,8 @@
 | code | 觸發時機 | Firebase `error.code` |
 |---|---|---|
 | `service_unavailable` | 對應的 Cloud Run 服務未設定(缺 `ALIGN_SERVICE_URL` / `WHISPERX_SERVICE_URL`) | `internal` |
-| `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `jobId`(舊版 client 為 `trackId`)) | `invalid-argument` |
-| `busy` | 同一個任務(同任務種類、同 `fingerprint`)仍在處理中;`details.activeTitle` 為曲名 | `failed-precondition` |
+| `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `jobId`(舊版 client 為已 deprecated 的 `trackId`)) | `invalid-argument` |
+| `busy` | 同一首歌同任務種類(同 `trackMd5` + `kind`)仍在處理中;`details.activeTitle` 為曲名 | `failed-precondition` |
 | `quota_exceeded` | 本月額度(對時 + 自動產生合併計算,預設 60 分鐘)已用盡 | `resource-exhausted` |
 | `dispatch_failed` | 派工到 Cloud Tasks 失敗 | `internal` |
 

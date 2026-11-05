@@ -51,7 +51,7 @@ queued → downloading_audio → transcribing → saving → done
 
 ### `done` 的寫入內容
 
-`done` 不是單獨更新 `status`,而是跟歌詞快照一起以 **merge** 寫入(保留派工時寫入的 `fingerprint` / `kind`,並清掉 `error`),欄位與 App 端 sync v5 的 `LyricsEntity` schema 一致:
+`done` 不是單獨更新 `status`,而是跟歌詞快照一起以 **merge** 寫入(保留派工時寫入的 `trackMd5` / `lyricsMd5` / `kind`,並清掉 `error`),欄位與 App 端 sync v5 的 `LyricsEntity` schema 一致:
 
 | 欄位 | 值 |
 |---|---|
@@ -71,12 +71,12 @@ queued → downloading_audio → transcribing → saving → done
 
 1. **任務文件本身已有產物**(舊版 client 以曲目指紋為文件 id 時才會命中):`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
 2. **任務文件本身進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。
-3. **依任務種類 + 指紋沿用**(client 有帶 `fingerprint` 時):直接 query `user/{uid}/lyrics` 裡 `fingerprint == 指紋` 且 `kind == 任務種類` 的任務文件:
-   - 有一份 `status == "done"` 且 `content` 非空(**處理成功過**)→ 把 `title` / `format` / `source` / `content` 複製到這次的任務文件(同時寫入 `fingerprint` / `kind`、`status = "done"`),回 `{"saved": true, "cached": true}`,不派工、不扣配額。
-   - 有一份仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
+3. **依任務種類 + MD5 沿用**(client 有帶 `trackMd5` 時):直接 query `user/{uid}/lyrics` 裡 `trackMd5 == 音檔 MD5` 且 `kind == 任務種類` 的任務文件(align 另加 `lyricsMd5 == 歌詞 MD5`):
+   - 有一份 `status == "done"` 且 `content` 非空(**處理成功過**)→ 把 `title` / `format` / `source` / `content` 複製到這次的任務文件(同時寫入 `trackMd5` / `lyricsMd5` / `kind`、`status = "done"`),回 `{"saved": true, "cached": true}`,不派工、不扣配額。align 的歌詞改過(`lyricsMd5` 不同)就不會沿用,一定重新對齊。
+   - 同一首歌同種類(只比 `trackMd5` + `kind`,不比歌詞)有一份仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
    - 其餘(沒有紀錄、都失敗或卡住)→ 照常派工。
 4. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
-5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`(有指紋時一併寫入 `fingerprint` / `kind`)。
+5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`(有 `trackMd5` 時一併寫入 `trackMd5` / `lyricsMd5` / `kind`)。
 
 每個 jobId 文件都是一個獨立的任務;沒有另外的快取集合,沿用時比對的就是任務文件本身的欄位。
 
@@ -84,10 +84,12 @@ queued → downloading_audio → transcribing → saving → done
 
 | 欄位 | 寫入者 | 說明 |
 |---|---|---|
-| `fingerprint` | `functions/main.py`(派工 / 沿用時) | 音檔內容指紋 `sha1("{size}:" + 頭 64KB + 尾 64KB)` 的 40 碼 hex(與舊版 trackId 同一套演算法);舊版 client 沒帶就不寫 |
+| `trackMd5` | `functions/main.py`(派工 / 沿用時) | 音檔全檔內容 MD5 的 32 碼 hex;舊版 client 沒帶就不寫 |
+| `lyricsMd5` | `functions/main.py`(align 派工 / 沿用時) | 送對時的歌詞行 MD5:`md5(utf8("\n".join(lines)))`;client 沒帶時由 `lines` 自算 |
+| `fingerprint` | 舊版 `functions/main.py` | **deprecated**,已由 `trackMd5` 取代。舊的 sha1 頭尾指紋,只留在舊文件上;client 帶的 `fingerprint` 參數一律忽略,不再寫入也不再比對 |
 | `kind` | `functions/main.py`(派工 / 沿用時) | 任務種類 `generate` / `align` |
 
-Cloud Run 存結果(`done`)與更新狀態都以 merge 寫入,這兩個欄位會一直留在任務文件上。進行中的查詢用到 `status in [...]` 搭配兩個等值條件,若 Firestore 回報需要 composite index,依錯誤訊息裡的連結建立即可。
+Cloud Run 存結果(`done`)與更新狀態都以 merge 寫入,這些欄位會一直留在任務文件上。查詢只有等值 / `in` 條件,若 Firestore 回報需要 composite index,依錯誤訊息裡的連結建立即可。
 
 ## 注意事項
 

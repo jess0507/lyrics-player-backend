@@ -7,11 +7,12 @@
   把工作丟進 Cloud Tasks,由佇列非同步呼叫 aeneas / WhisperX Cloud Run 服務;
   **立刻回應,不等處理完成**。Cloud Run 端點處理完後自行把結果寫入 Firestore
   ``user/{uid}/lyrics/{jobId}``(不經 RPC 回傳歌詞內文)。jobId 由 client 每次
-  送出時產生(舊版 client 以 ``trackId`` 參數傳入曲目指紋,同樣當文件 id 用)。
-  client 另帶音檔內容指紋 ``fingerprint`` 時,先 query 任務文件比對同任務
-  種類(``kind``)、同指紋且處理成功的結果(見 ``_reuse_succeeded_task``):
-  有就複製到這次的 jobId 文件並回應成功、不重跑;同一個任務還在處理中則
-  回 busy。
+  送出時產生(``trackId`` 參數已 deprecated,僅供舊版 client 當文件 id 用)。
+  client 帶音檔 MD5 ``trackMd5``(對時另帶歌詞 MD5 ``lyricsMd5``)時,先 query
+  任務文件比對同任務種類(``kind``)、同 MD5 且處理成功的結果(見
+  ``_reuse_succeeded_task``):有就複製到這次的 jobId 文件並回應成功、不重跑;
+  同一首歌同種類的任務還在處理中則回 busy。舊的 ``fingerprint`` 參數 / 欄位
+  已 deprecated(由 ``trackMd5`` 取代),不再讀取比對。
   派工成功後在同一份文件寫入
   ``status = "queued"``,後續由 Cloud Run 端點接力更新(見
   ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的狀態機說明),
@@ -20,6 +21,7 @@
 皆需登入(以 callable context 的 ``auth.uid`` 為準,使用者只能操作自己的資料)。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -92,14 +94,21 @@ def _require_uid(req: https_fn.CallableRequest) -> str:
     return req.auth.uid
 
 
-# ---- 依任務種類 + 音檔內容指紋沿用既有結果 ----
+# ---- 依任務種類 + 音檔 / 歌詞 MD5 沿用既有結果 ----
 #
 # client 每次送出都用新的 jobId 當任務文件 id,文件 id 不再代表曲目,無法再以
-# 「同一份文件已有結果」判斷是否處理過。改由 client 附上音檔內容指紋
-# ``fingerprint``(``sha1("{size}:" + 頭 64KB + 尾 64KB)``,與舊版 trackId 同一套
-# 演算法);派工時把 ``fingerprint`` 與任務種類 ``kind``(``generate`` /
-# ``align``)寫進任務文件,下次同一個任務直接 query 任務文件比對。
-# Cloud Run 存結果時以 merge 寫入,這兩個欄位會一直保留在文件上。
+# 「同一份文件已有結果」判斷是否處理過。改由 client 附上:
+# - ``trackMd5``:音檔全檔內容 MD5(generate / align 都帶)。
+# - ``lyricsMd5``:對時送出的歌詞行 MD5(僅 align),``md5(utf8("\n".join(lines)))``。
+# 派工時把它們與任務種類 ``kind``(``generate`` / ``align``)寫進任務文件,下次
+# 直接 query 任務文件比對:
+# - generate:``trackMd5`` + ``kind`` 相同,且 ``content`` 非空 → 沿用。
+# - align:``trackMd5`` + ``kind`` + ``lyricsMd5`` 都相同,且 ``content`` 非空 →
+#   沿用。歌詞改過(例如重新貼上)就是不同任務,一定重新對齊。
+# Cloud Run 存結果時以 merge 寫入,這些欄位會一直保留在文件上。
+# ``fingerprint``(sha1 頭尾指紋)已 deprecated、由 ``trackMd5`` 取代:不再讀取
+# client 帶的 ``fingerprint``,也不再寫入。舊文件只有 ``fingerprint`` 沒有 MD5,
+# 不會被比對到,第一次會重跑。
 
 _KIND_GENERATE = "generate"
 _KIND_ALIGN = "align"
@@ -107,7 +116,7 @@ _KIND_ALIGN = "align"
 # 任務卡在處理中狀態超過這麼久(Cloud Run 中途掛掉等)視為失效,不再擋新派工。
 _STALE_IN_PROGRESS_MS = 30 * 60 * 1000
 
-_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_MD5_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _now_ms() -> int:
@@ -118,27 +127,37 @@ def _lyrics_collection(uid: str):
     return firestore.client().collection("user").document(uid).collection("lyrics")
 
 
-def _valid_fingerprint(fingerprint) -> str | None:
-    """合法的 40 碼 sha1 hex 才回傳;舊版 client 沒帶或格式不符回 None。"""
-    if isinstance(fingerprint, str) and _FINGERPRINT_PATTERN.match(fingerprint):
-        return fingerprint
+def _valid_md5(value) -> str | None:
+    """合法的 32 碼 MD5 hex 才回傳;舊版 client 沒帶或格式不符回 None。"""
+    if isinstance(value, str) and _MD5_PATTERN.match(value):
+        return value
     return None
 
 
-def _same_task_query(uid: str, kind: str, fingerprint: str):
-    """同任務種類、同指紋的任務文件。"""
+def _lines_md5(lines: list) -> str:
+    """歌詞行的 MD5,與 client ``lyricsLinesMd5`` 同一套算法。"""
+    return hashlib.md5("\n".join(str(line) for line in lines).encode("utf-8")).hexdigest()
+
+
+def _same_track_query(uid: str, kind: str, track_md5: str):
+    """同任務種類、同音檔 MD5 的任務文件。"""
     return (
         _lyrics_collection(uid)
-        .where(filter=FieldFilter("fingerprint", "==", fingerprint))
+        .where(filter=FieldFilter("trackMd5", "==", track_md5))
         .where(filter=FieldFilter("kind", "==", kind))
     )
 
 
-def _find_succeeded_task(uid: str, kind: str, fingerprint: str) -> dict | None:
-    """同一個任務曾**處理成功**(``status == "done"`` 且有內文)的結果。"""
-    query = _same_task_query(uid, kind, fingerprint).where(
+def _find_succeeded_task(
+    uid: str, kind: str, track_md5: str, lyrics_md5: str | None
+) -> dict | None:
+    """同一個任務曾**處理成功**(``status == "done"`` 且 ``content`` 非空)的結果。
+    ``lyrics_md5`` 有值(align)時歌詞 MD5 也必須相同。"""
+    query = _same_track_query(uid, kind, track_md5).where(
         filter=FieldFilter("status", "==", "done")
     )
+    if lyrics_md5 is not None:
+        query = query.where(filter=FieldFilter("lyricsMd5", "==", lyrics_md5))
     for snapshot in query.limit(5).stream():
         data = snapshot.to_dict() or {}
         if data.get("content"):
@@ -146,9 +165,10 @@ def _find_succeeded_task(uid: str, kind: str, fingerprint: str) -> dict | None:
     return None
 
 
-def _find_running_task(uid: str, kind: str, fingerprint: str) -> dict | None:
-    """同一個任務仍在處理中(30 分鐘內有更新)的文件。"""
-    query = _same_task_query(uid, kind, fingerprint).where(
+def _find_running_task(uid: str, kind: str, track_md5: str) -> dict | None:
+    """同一首歌同種類的任務仍在處理中(30 分鐘內有更新)的文件。不比對歌詞
+    MD5:同一首歌一次只跑一件,改過歌詞的對時要等前一件結束再送。"""
+    query = _same_track_query(uid, kind, track_md5).where(
         filter=FieldFilter("status", "in", sorted(_IN_PROGRESS_STATUSES))
     )
     now = _now_ms()
@@ -159,19 +179,35 @@ def _find_running_task(uid: str, kind: str, fingerprint: str) -> dict | None:
     return None
 
 
+def _task_keys(kind: str, track_md5: str, lyrics_md5: str | None) -> dict:
+    """寫進任務文件、供之後比對沿用的欄位。"""
+    keys = {"trackMd5": track_md5, "kind": kind}
+    if lyrics_md5 is not None:
+        keys["lyricsMd5"] = lyrics_md5
+    return keys
+
+
 def _reuse_succeeded_task(
-    uid: str, job_id: str, kind: str, fingerprint: str | None, title
+    uid: str,
+    job_id: str,
+    kind: str,
+    track_md5: str | None,
+    lyrics_md5: str | None,
+    title,
 ) -> bool:
-    """同任務種類、同指紋且曾處理成功:把結果複製到這次的任務文件並回 True
-    (呼叫端直接回應 cached);同一個任務仍在處理中則丟 busy;其餘回 False
-    (照常派工)。沒帶指紋(舊版 client)一律回 False。"""
-    if fingerprint is None:
+    """同一個任務曾處理成功:把結果複製到這次的任務文件並回 True(呼叫端直接
+    回應 cached);同一首歌同種類的任務仍在處理中則丟 busy;其餘回 False
+    (照常派工)。沒帶 ``trackMd5``(舊版 client)一律回 False。
+
+    「同一個任務」:``trackMd5`` + ``kind`` 相同;align 另需 ``lyricsMd5`` 相同
+    (``lyrics_md5`` 由呼叫端保證 align 一定有值)。"""
+    if track_md5 is None:
         return False
-    succeeded = _find_succeeded_task(uid, kind, fingerprint)
+    succeeded = _find_succeeded_task(uid, kind, track_md5, lyrics_md5)
     if succeeded is not None:
         now = _now_ms()
         # 與 Cloud Run 的 _save_lyrics_snapshot 同一份 schema,client 監聽到
-        # done 即照常存回本機;fingerprint / kind 一併寫入,這份也能再被沿用。
+        # done 即照常存回本機;比對欄位一併寫入,這份也能再被沿用。
         _lyrics_collection(uid).document(job_id).set(
             {
                 "title": title or succeeded.get("title") or "",
@@ -181,12 +217,11 @@ def _reuse_succeeded_task(
                 "addedAt": now,
                 "status": "done",
                 "statusUpdatedAt": now,
-                "fingerprint": fingerprint,
-                "kind": kind,
+                **_task_keys(kind, track_md5, lyrics_md5),
             }
         )
         return True
-    running = _find_running_task(uid, kind, fingerprint)
+    running = _find_running_task(uid, kind, track_md5)
     if running is not None:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
@@ -318,13 +353,18 @@ def _write_status(uid: str, track_id: str, status: str, extra: dict | None = Non
 
 
 def _write_queued_status(
-    uid: str, track_id: str, kind: str, fingerprint: str | None
+    uid: str,
+    track_id: str,
+    kind: str,
+    track_md5: str | None,
+    lyrics_md5: str | None = None,
 ) -> None:
     """把工作標記為已進佇列(``status = "queued"``),讓 client 在收到 RPC 回應
     的當下就能顯示進度,不必等 Cloud Run 端點處理到一半才第一次看到狀態。
-    有指紋時一併寫入 ``fingerprint`` / ``kind``,供之後同一個任務比對沿用。
+    有音檔 MD5 時一併寫入 ``trackMd5`` / ``kind``(align 另有 ``lyricsMd5``),
+    供之後同一個任務比對沿用。
     """
-    extra = {"fingerprint": fingerprint, "kind": kind} if fingerprint else None
+    extra = _task_keys(kind, track_md5, lyrics_md5) if track_md5 else None
     _write_status(uid, track_id, "queued", extra)
 
 
@@ -382,17 +422,22 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``format``: str(選填),音訊副檔名提示。
         - ``jobId``: str,這次任務的文件 id;結果存在
           ``user/{uid}/lyrics/{jobId}``。新版 client 必帶。
-        - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
-          文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
-        - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
-          查同一個任務是否處理成功過(見 ``_reuse_succeeded_task``)。
+        - ``trackId``: **deprecated**。舊版 client 的曲目指紋,沒帶 ``jobId``
+          時才當任務文件 id 用;新版 client 不再送。
+        - ``trackMd5``: str(選填),音檔全檔 MD5(32 碼 hex);有帶才查同一個
+          任務是否處理成功過(見 ``_reuse_succeeded_task``)。
+        - ``fingerprint``: **deprecated**,已由 ``trackMd5`` 取代。舊版 client
+          的音檔指紋(40 碼 sha1 頭尾),收到也一律忽略、不再比對。
+        - ``lyricsMd5``: str(選填),``lines`` 的 MD5
+          (``md5(utf8("\\n".join(lines)))``);沒帶時由 ``lines`` 自算。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意:
-        - 同一個任務(同任務種類、同指紋)上次處理成功 → 複製到這次的任務文件
+        - 同一個任務(同任務種類、同 ``trackMd5``、同 ``lyricsMd5``)上次處理成功
+          且有內文 → 複製到這次的任務文件
           (``status = "done"``)並回 ``{"saved": True, "cached": True}``,
           不派工、不扣配額;舊版 client 則看任務文件本身是否已有快照。
-        - 同一首歌仍在處理中 → ``failed-precondition``(``details.code = "busy"``)。
+        - 同一首歌(同 ``trackMd5``)仍在處理中 → ``failed-precondition``(``details.code = "busy"``)。
         - 否則派工成功 → ``{"saved": True, "queued": True}``,**此時歌詞尚未
           產生完成**,client 不應假設此刻已可讀到內容。
         - 驗證失敗 / 配額用盡 / 派工失敗以 HttpsError 回對應錯誤碼。
@@ -405,9 +450,11 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     obj = data.get("object")
     language = data.get("language") or "eng"
     audio_format = data.get("format")
-    # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
+    # 任務文件 id:新版 client 帶 jobId;``trackId`` 已 deprecated,只給舊版
+    # client(沒帶 jobId)當文件 id 用。
     track_id = data.get("jobId") or data.get("trackId")
-    fingerprint = _valid_fingerprint(data.get("fingerprint"))
+    # ``fingerprint`` 已 deprecated(由 trackMd5 取代),舊版 client 帶了也不讀。
+    track_md5 = _valid_md5(data.get("trackMd5"))
     title = data.get("title")
     engine = data.get("engine") or "aeneas"
     service_url = _service_url_for(engine)
@@ -437,7 +484,12 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
 
-    if _reuse_succeeded_task(uid, str(track_id), _KIND_ALIGN, fingerprint, title):
+    # 歌詞 MD5 以 client 帶的為準,沒帶 / 格式不符就由實際收到的 lines 自算,
+    # 確保 align 的沿用一定比對到歌詞內容。
+    lyrics_md5 = _valid_md5(data.get("lyricsMd5")) or _lines_md5(lines)
+    if _reuse_succeeded_task(
+        uid, str(track_id), _KIND_ALIGN, track_md5, lyrics_md5, title
+    ):
         return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
@@ -475,7 +527,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "dispatch_failed"},
         )
 
-    _write_queued_status(uid, str(track_id), _KIND_ALIGN, fingerprint)
+    _write_queued_status(uid, str(track_id), _KIND_ALIGN, track_md5, lyrics_md5)
     return {"saved": True, "queued": True}
 
 
@@ -500,10 +552,12 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``format``: str(選填),音訊副檔名提示。
         - ``jobId``: str,這次任務的文件 id;結果存在
           ``user/{uid}/lyrics/{jobId}``。新版 client 必帶。
-        - ``trackId``: str,舊版 client 的曲目指紋,沒帶 ``jobId`` 時當任務
-          文件 id 用(新版 client 也會帶,值同 ``jobId``)。兩者至少一個。
-        - ``fingerprint``: str(選填),音檔內容指紋(40 碼 sha1 hex);有帶才
-          查同一個任務是否處理成功過(見 ``_reuse_succeeded_task``)。
+        - ``trackId``: **deprecated**。舊版 client 的曲目指紋,沒帶 ``jobId``
+          時才當任務文件 id 用;新版 client 不再送。
+        - ``trackMd5``: str(選填),音檔全檔 MD5(32 碼 hex);有帶才查同一個
+          任務是否處理成功過(見 ``_reuse_succeeded_task``)。
+        - ``fingerprint``: **deprecated**,已由 ``trackMd5`` 取代。舊版 client
+          的音檔指紋(40 碼 sha1 頭尾),收到也一律忽略、不再比對。
         - ``title``: str(選填),曲名,隨快照一併存入。
 
     回應語意同 ``align_lyrics``:``{"saved": True, "cached": True}`` 或
@@ -516,9 +570,11 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     obj = data.get("object")
     language = data.get("language")  # 選填:省略 → 後端自動偵測語言。
     audio_format = data.get("format")
-    # 任務文件 id:新版 client 帶 jobId;舊版只帶 trackId(曲目指紋)。
+    # 任務文件 id:新版 client 帶 jobId;``trackId`` 已 deprecated,只給舊版
+    # client(沒帶 jobId)當文件 id 用。
     track_id = data.get("jobId") or data.get("trackId")
-    fingerprint = _valid_fingerprint(data.get("fingerprint"))
+    # ``fingerprint`` 已 deprecated(由 trackMd5 取代),舊版 client 帶了也不讀。
+    track_md5 = _valid_md5(data.get("trackMd5"))
     title = data.get("title")
 
     if not _WHISPERX_SERVICE_URL:
@@ -541,7 +597,9 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     if _task_in_progress(uid, str(track_id)):
         return {"saved": True, "queued": True}
 
-    if _reuse_succeeded_task(uid, str(track_id), _KIND_GENERATE, fingerprint, title):
+    if _reuse_succeeded_task(
+        uid, str(track_id), _KIND_GENERATE, track_md5, None, title
+    ):
         return {"saved": True, "cached": True}
 
     if _monthly_quota_exceeded(uid):
@@ -579,5 +637,5 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "dispatch_failed"},
         )
 
-    _write_queued_status(uid, str(track_id), _KIND_GENERATE, fingerprint)
+    _write_queued_status(uid, str(track_id), _KIND_GENERATE, track_md5)
     return {"saved": True, "queued": True}
