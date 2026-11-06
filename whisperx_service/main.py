@@ -106,15 +106,55 @@ def _write_status(uid: str, track_id: str, status: str, error: str | None = None
         )
 
 
-def _add_monthly_usage(uid: str, seconds: float) -> None:
-    """把這次實際處理的音訊秒數加進 ``usage/{uid}``(``{month: "YYYY-MM",
-    secondsUsed: n}``),供 ``functions/main.py`` 的 ``_monthly_quota_exceeded``
-    檢查每月配額用量(對時 / 自動產生合併計算)。以 ``month`` 變更判定跨月
-    歸零,無需排程清理。
+def _current_usage_month() -> str:
+    """用量記帳用的月份 key(UTC ``YYYY-MM``)。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _usage_month_ref(db, uid: str, month: str):
+    """``usage/{uid}/months/{YYYY-MM}``:每月一份用量文件
+    (``{month, secondsUsed, updatedAt}``),保留歷史月份供查詢 / 統計;
+    ``functions/main.py`` 的 ``_ensure_quota`` 只讀當月那份。"""
+    return db.collection("usage").document(uid).collection("months").document(month)
+
+
+def _read_month_seconds(db, transaction, uid: str, month: str) -> float:
+    """在 transaction 內讀出某月已用秒數。
+
+    相容舊格式:當月文件還不存在時,改看舊版單一文件 ``usage/{uid}``
+    (``{month, secondsUsed}``),月份相符就沿用其值,避免上線當月用量歸零。
+    """
+    snap = _usage_month_ref(db, uid, month).get(transaction=transaction)
+    if snap.exists:
+        return float((snap.to_dict() or {}).get("secondsUsed", 0) or 0)
+    legacy = db.collection("usage").document(uid).get(transaction=transaction)
+    data = legacy.to_dict() or {}
+    if data.get("month") == month:
+        return float(data.get("secondsUsed", 0) or 0)
+    return 0.0
+
+
+def _write_month_seconds(db, transaction, uid: str, month: str, seconds: float) -> None:
+    from google.cloud import firestore
+
+    transaction.set(
+        _usage_month_ref(db, uid, month),
+        {
+            "month": month,
+            "secondsUsed": max(0.0, seconds),
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+    )
+
+
+def _add_monthly_usage(uid: str, seconds: float, month: str) -> None:
+    """把 ``seconds`` 加進 ``usage/{uid}/months/{month}``(見 ``_usage_month_ref``)。
+
+    ``month`` 由呼叫端傳入(記帳當下的 ``_current_usage_month()``),處理失敗
+    扣回時才會扣在當初記帳的那個月,不會因為處理期間跨月而扣錯月份。
 
     ``seconds`` 可為負數,供處理失敗時把先前(下載完成、音訊長度一知道就先
-    記的)用量扣回(見 ``align_endpoint`` / ``transcribe_endpoint``)——
-    ``max(0, ...)`` 避免扣成負數(例如扣回當下已跨月、本月尚未有其他用量)。
+    記的)用量扣回——``max(0, ...)`` 避免扣成負數。
 
     只是用量記帳,失敗不該讓已經存好的歌詞結果跟著回錯,故吞例外、只記 log
     (與 ``_write_status`` 同樣的原則)。
@@ -122,22 +162,62 @@ def _add_monthly_usage(uid: str, seconds: float) -> None:
     from google.cloud import firestore
 
     db = firestore.Client()
-    ref = db.collection("usage").document(uid)
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     @firestore.transactional
     def _txn(transaction) -> None:
-        snap = ref.get(transaction=transaction)
-        data = snap.to_dict() or {}
-        current = data.get("secondsUsed", 0) if data.get("month") == month else 0
-        transaction.set(
-            ref, {"month": month, "secondsUsed": max(0.0, current + seconds)}
-        )
+        current = _read_month_seconds(db, transaction, uid, month)
+        _write_month_seconds(db, transaction, uid, month, current + seconds)
 
     try:
         _txn(db.transaction())
     except Exception:
-        log.exception("寫入本月用量失敗(uid=%s)", uid)
+        log.exception("寫入用量失敗(uid=%s month=%s)", uid, month)
+
+
+def _payload_quota_seconds(payload: dict) -> float | None:
+    """取出派工 payload 的 ``quotaSeconds``(本月上限,秒);沒帶 / 非正數回
+    None,代表不限制(豁免帳號,或舊版 Function 派的工)。"""
+    value = payload.get("quotaSeconds")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def _reserve_monthly_usage(
+    uid: str, seconds: float, quota_seconds: float | None, month: str
+) -> bool | None:
+    """在同一個 transaction 內檢查並記帳 ``usage/{uid}/months/{month}``:
+    ``quota_seconds`` 不為 None 且「該月已用量 + ``seconds``」超過上限時不寫入、
+    回 False;否則記帳並回 True。Firestore 失敗回 None(只記 log、放行處理但
+    不算已記帳,與 ``_add_monthly_usage`` 吞例外的原則一致)。
+
+    檢查與記帳在同一個 transaction,短時間連發多個請求也不會一起通過檢查而超額。
+    """
+    from google.cloud import firestore
+
+    db = firestore.Client()
+
+    @firestore.transactional
+    def _txn(transaction) -> bool:
+        current = _read_month_seconds(db, transaction, uid, month)
+        if quota_seconds is not None and current + seconds > quota_seconds:
+            log.info(
+                "超出本月額度,拒絕(uid=%s month=%s 已用=%.0fs 本次=%.0fs 上限=%.0fs)",
+                uid,
+                month,
+                current,
+                seconds,
+                quota_seconds,
+            )
+            return False
+        _write_month_seconds(db, transaction, uid, month, current + seconds)
+        return True
+
+    try:
+        return _txn(db.transaction())
+    except Exception:
+        log.exception("檢查 / 寫入用量失敗(uid=%s month=%s)", uid, month)
+        return None
 
 
 def _probe_duration_seconds(audio_path: str) -> float:
@@ -283,18 +363,39 @@ def align_endpoint():
 
     # 音訊已下載、長度已知——不必等對齊跑完就先記一筆用量,關掉配額檢查與
     # 實際扣量之間的空窗(同一使用者短時間連發多個請求,原本都會在對齊完成
-    # 前通過 `_monthly_quota_exceeded` 檢查而超額)。之後任何一步失敗,
+    # 前通過 `_ensure_quota` 檢查而超額)。之後任何一步失敗,
     # 在各自的失敗分支把這筆用量扣回。
+    #
+    # 有帶 ``quotaSeconds``(``functions/main.py`` 派工時依使用者帶入,豁免帳號
+    # 不帶)就在同一個 transaction 內確認「本月已用量 + 這次長度」不超過上限,
+    # 超過則不記帳、直接拒絕,避免單一長音檔一次吃掉遠超上限的用量。
     duration_seconds = 0.0
     usage_recorded = False
+    usage_month = _current_usage_month()
     if uid and track_id:
         try:
             duration_seconds = _probe_duration_seconds(audio_path)
         except Exception:
             log.exception("量測音訊長度失敗(uid=%s trackId=%s)", uid, track_id)
+        quota_seconds = _payload_quota_seconds(payload)
+        if quota_seconds is not None and duration_seconds <= 0:
+            # 有配額限制卻量不出長度,無法確認是否超額,一律拒絕。
+            cleanup()
+            return _fail(uid, track_id, "invalid_request", "無法量測音訊長度", 400)
         if duration_seconds > 0:
-            _add_monthly_usage(str(uid), duration_seconds)
-            usage_recorded = True
+            reserved = _reserve_monthly_usage(
+                str(uid), duration_seconds, quota_seconds, usage_month
+            )
+            if reserved is False:
+                cleanup()
+                return _fail(
+                    uid,
+                    track_id,
+                    "quota_exceeded",
+                    f"本月剩餘額度不足以處理這段 {duration_seconds:.0f} 秒的音訊",
+                    429,
+                )
+            usage_recorded = reserved is True
 
     if uid and track_id:
         _write_status(str(uid), str(track_id), STATUS_ALIGNING)
@@ -309,17 +410,17 @@ def align_endpoint():
             "對齊模型載入失敗(503,已耗時 %.1fs):%s", time.perf_counter() - t0, exc
         )
         if usage_recorded:
-            _add_monthly_usage(str(uid), -duration_seconds)
+            _add_monthly_usage(str(uid), -duration_seconds, usage_month)
         return _fail(uid, track_id, "align_model_unavailable", str(exc), 503)
     except AlignmentError as exc:
         log.warning("對齊失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
         if usage_recorded:
-            _add_monthly_usage(str(uid), -duration_seconds)
+            _add_monthly_usage(str(uid), -duration_seconds, usage_month)
         return _fail(uid, track_id, "alignment_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("對齊時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
         if usage_recorded:
-            _add_monthly_usage(str(uid), -duration_seconds)
+            _add_monthly_usage(str(uid), -duration_seconds, usage_month)
         return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
@@ -344,7 +445,7 @@ def align_endpoint():
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
             if usage_recorded:
-                _add_monthly_usage(str(uid), -duration_seconds)
+                _add_monthly_usage(str(uid), -duration_seconds, usage_month)
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )
@@ -405,18 +506,39 @@ def transcribe_endpoint():
 
     # 音訊已下載、長度已知——不必等轉寫跑完就先記一筆用量,關掉配額檢查與
     # 實際扣量之間的空窗(同一使用者短時間連發多個請求,原本都會在轉寫完成
-    # 前通過 `_monthly_quota_exceeded` 檢查而超額)。之後任何一步失敗,
+    # 前通過 `_ensure_quota` 檢查而超額)。之後任何一步失敗,
     # 在各自的失敗分支把這筆用量扣回。
+    #
+    # 有帶 ``quotaSeconds``(``functions/main.py`` 派工時依使用者帶入,豁免帳號
+    # 不帶)就在同一個 transaction 內確認「本月已用量 + 這次長度」不超過上限,
+    # 超過則不記帳、直接拒絕,避免單一長音檔一次吃掉遠超上限的用量。
     duration_seconds = 0.0
     usage_recorded = False
+    usage_month = _current_usage_month()
     if uid and track_id:
         try:
             duration_seconds = _probe_duration_seconds(audio_path)
         except Exception:
             log.exception("量測音訊長度失敗(uid=%s trackId=%s)", uid, track_id)
+        quota_seconds = _payload_quota_seconds(payload)
+        if quota_seconds is not None and duration_seconds <= 0:
+            # 有配額限制卻量不出長度,無法確認是否超額,一律拒絕。
+            cleanup()
+            return _fail(uid, track_id, "invalid_request", "無法量測音訊長度", 400)
         if duration_seconds > 0:
-            _add_monthly_usage(str(uid), duration_seconds)
-            usage_recorded = True
+            reserved = _reserve_monthly_usage(
+                str(uid), duration_seconds, quota_seconds, usage_month
+            )
+            if reserved is False:
+                cleanup()
+                return _fail(
+                    uid,
+                    track_id,
+                    "quota_exceeded",
+                    f"本月剩餘額度不足以處理這段 {duration_seconds:.0f} 秒的音訊",
+                    429,
+                )
+            usage_recorded = reserved is True
 
     if uid and track_id:
         _write_status(str(uid), str(track_id), STATUS_TRANSCRIBING)
@@ -428,12 +550,12 @@ def transcribe_endpoint():
         # 在 log 無痕,難以判斷是音訊問題還是模型沒抓到歌聲。
         log.warning("轉寫失敗(422,已耗時 %.1fs):%s", time.perf_counter() - t0, exc)
         if usage_recorded:
-            _add_monthly_usage(str(uid), -duration_seconds)
+            _add_monthly_usage(str(uid), -duration_seconds, usage_month)
         return _fail(uid, track_id, "transcription_failed", str(exc), 422)
     except Exception as exc:  # 非預期失敗
         log.exception("轉寫時發生未預期錯誤(已耗時 %.1fs)", time.perf_counter() - t0)
         if usage_recorded:
-            _add_monthly_usage(str(uid), -duration_seconds)
+            _add_monthly_usage(str(uid), -duration_seconds, usage_month)
         return _fail(uid, track_id, "internal", f"內部錯誤:{exc}", 500)
     finally:
         cleanup()
@@ -458,7 +580,7 @@ def transcribe_endpoint():
                 "寫入歌詞快照到 Firestore 失敗(uid=%s trackId=%s)", uid, track_id
             )
             if usage_recorded:
-                _add_monthly_usage(str(uid), -duration_seconds)
+                _add_monthly_usage(str(uid), -duration_seconds, usage_month)
             return _fail(
                 uid, track_id, "firestore_write_failed", f"寫入 Firestore 失敗:{exc}", 500
             )

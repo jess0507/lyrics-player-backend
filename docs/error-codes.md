@@ -15,6 +15,7 @@
 | `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `jobId`(舊版 client 為已 deprecated 的 `trackId`)) | `invalid-argument` |
 | `busy` | 同一首歌同任務種類(同 `trackMd5` + `kind`)仍在處理中;`details.activeTitle` 為曲名 | `failed-precondition` |
 | `quota_exceeded` | 本月額度(對時 + 自動產生合併計算,預設 60 分鐘)已用盡 | `resource-exhausted` |
+| `quota_insufficient` | client 帶了 `durationSeconds`,且「本月已用量 + 這段音訊長度」超過上限;`details.remainingSeconds` / `details.durationSeconds` 為剩餘額度與音訊長度(秒) | `resource-exhausted` |
 | `dispatch_failed` | 派工到 Cloud Tasks 失敗 | `internal` |
 
 ## 非同步處理(`whisperx_service/main.py` / `aeneas_service/main.py`)
@@ -23,13 +24,14 @@ Cloud Run 服務處理失敗時,寫入 `users/{uid}/lyrics/{jobId}`:`status = "f
 
 | code | 觸發時機 | 服務 |
 |---|---|---|
-| `invalid_request` | request body 驗證失敗(如 `lines` 非陣列、缺 `audio`) | 兩者皆有 |
+| `invalid_request` | request body 驗證失敗(如 `lines` 非陣列、缺 `audio`),或有配額限制卻量不出音訊長度 | 兩者皆有 |
 | `audio_fetch_failed` | 從 GCS 下載音訊失敗 | 兩者皆有 |
 | `align_model_unavailable` | 對齊模型從 HuggingFace 載入失敗(逾時等暫時性問題,可重試) | 僅 `whisperx_service` `/align` |
 | `alignment_failed` | 對齊完成但結果不可用(覆蓋率過低等) | 兩者皆有 |
 | `transcription_failed` | ASR 辨識不出歌詞文字 | 僅 `whisperx_service` `/transcribe` |
 | `internal` | 其他非預期例外 | 兩者皆有 |
 | `firestore_write_failed` | 結果算出來了,但寫回 Firestore 失敗 | 兩者皆有 |
+| `quota_exceeded` | 量出實際音訊長度後,「本月已用量 + 長度」超過派工時帶的 `quotaSeconds`(不記帳、不處理) | 兩者皆有 |
 
 ## 沒有 code、無法客製化的情況
 

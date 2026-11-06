@@ -254,27 +254,73 @@ def delete_account(req: https_fn.CallableRequest) -> dict:
     return {"deleted": True, "uid": uid}
 
 
-def _monthly_quota_exceeded(uid: str) -> bool:
-    """檢查使用者本月(對時 + 自動產生合併計算)用量是否已達上限。
-
-    只檢查、不累加——實際用量是處理完成後,由 Cloud Run 服務依實際音訊秒數
-    寫入 ``usage/{uid}``(``{month: "YYYY-MM", secondsUsed: n}``,見
-    ``whisperx_service/main.py`` / ``aeneas_service/main.py`` 的
-    ``_add_monthly_usage``)。以 ``month`` 變更判定跨月,無需排程歸零。
-    """
-    # 豁免帳號(測試 / 內部)不受上限限制。
+def _quota_seconds_for(uid: str) -> int | None:
+    """使用者的每月上限(秒);豁免帳號(測試 / 內部)回 None 代表不限制。"""
     if uid in _RATE_LIMIT_EXEMPT_UIDS:
-        return False
+        return None
+    return _MONTHLY_QUOTA_SECONDS
 
-    doc = firestore.client().collection("usage").document(uid).get()
-    if not doc.exists:
-        return False
-    data = doc.to_dict() or {}
+
+def _monthly_seconds_used(uid: str) -> float:
+    """本月(對時 + 自動產生合併計算)已用秒數。
+
+    用量依月份分開存在 ``usage/{uid}/months/{YYYY-MM}``
+    (``{month, secondsUsed, updatedAt}``),歷史月份保留不刪;由 Cloud Run
+    服務量出音訊長度後寫入(見 ``whisperx_service/main.py`` /
+    ``aeneas_service/main.py`` 的 ``_reserve_monthly_usage``)。
+
+    相容舊格式:當月文件還不存在時,改看舊版單一文件 ``usage/{uid}``
+    (``{month, secondsUsed}``),月份相符就沿用。
+    """
+    db = firestore.client()
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    if data.get("month") != current_month:
-        return False
-    return data.get("secondsUsed", 0) >= _MONTHLY_QUOTA_SECONDS
+    user_ref = db.collection("usage").document(uid)
+    doc = user_ref.collection("months").document(current_month).get()
+    if not doc.exists:
+        doc = user_ref.get()
+        if not doc.exists or (doc.to_dict() or {}).get("month") != current_month:
+            return 0.0
+    return float((doc.to_dict() or {}).get("secondsUsed", 0) or 0)
 
+
+def _client_duration_seconds(data: dict) -> float | None:
+    """client 帶的音訊長度(秒);沒帶 / 非正數回 None。僅供派工前提早擋下,
+    不可信任——權威檢查在 Cloud Run 量測實際音訊後進行。"""
+    value = data.get("durationSeconds")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def _ensure_quota(uid: str, quota_seconds: int | None, duration: float | None) -> None:
+    """派工前檢查本月額度,不足時丟 ``resource-exhausted``:
+
+    - 已用量 ≥ 上限 → ``quota_exceeded``。
+    - client 有帶 ``durationSeconds`` 且「已用量 + 長度」> 上限 →
+      ``quota_insufficient``(``details`` 附 ``remainingSeconds`` /
+      ``durationSeconds``)。
+
+    只檢查、不記帳;記帳與權威檢查由 Cloud Run 依實際音訊長度處理。
+    """
+    if quota_seconds is None:
+        return
+    used = _monthly_seconds_used(uid)
+    if used >= quota_seconds:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+            message="本月自動對時/產生歌詞額度已用盡,請下個月再試。",
+            details={"code": "quota_exceeded"},
+        )
+    if duration is not None and used + duration > quota_seconds:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+            message="本月剩餘額度不足以處理這段音訊。",
+            details={
+                "code": "quota_insufficient",
+                "remainingSeconds": max(0.0, quota_seconds - used),
+                "durationSeconds": duration,
+            },
+        )
 
 def _has_generated_snapshot(uid: str, track_id: str) -> bool:
     """檢查 ``user/{uid}/lyrics/{trackId}`` 是否已有對時 / 自動產生過的快照
@@ -431,6 +477,9 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``lyricsMd5``: str(選填),``lines`` 的 MD5
           (``md5(utf8("\\n".join(lines)))``);沒帶時由 ``lines`` 自算。
         - ``title``: str(選填),曲名,隨快照一併存入。
+        - ``durationSeconds``: number(選填),client 量到的音訊長度(秒);
+          有帶就在派工前確認「本月已用量 + 長度」不超過上限(``quota_insufficient``)。
+          不可信任,權威檢查由 Cloud Run 量測實際音訊後進行。
 
     回應語意:
         - 同一個任務(同任務種類、同 ``trackMd5``、同 ``lyricsMd5``)上次處理成功
@@ -492,12 +541,8 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     ):
         return {"saved": True, "cached": True}
 
-    if _monthly_quota_exceeded(uid):
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
-            message="本月自動對時/產生歌詞額度已用盡,請下個月再試。",
-            details={"code": "quota_exceeded"},
-        )
+    quota_seconds = _quota_seconds_for(uid)
+    _ensure_quota(uid, quota_seconds, _client_duration_seconds(data))
 
     # 暫存音訊的清理交給 bucket lifecycle(align/ 前綴定期刪),後端不即時刪除,
     # 故 Cloud Run SA 只需 storage.objectViewer。
@@ -514,6 +559,9 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
         "trackId": str(track_id),
         "title": title or "",
     }
+    # Cloud Run 量出實際長度後依此做權威的配額檢查;豁免帳號不帶 = 不限制。
+    if quota_seconds is not None:
+        payload["quotaSeconds"] = quota_seconds
 
     try:
         _enqueue_task(
@@ -559,6 +607,9 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         - ``fingerprint``: **deprecated**,已由 ``trackMd5`` 取代。舊版 client
           的音檔指紋(40 碼 sha1 頭尾),收到也一律忽略、不再比對。
         - ``title``: str(選填),曲名,隨快照一併存入。
+        - ``durationSeconds``: number(選填),client 量到的音訊長度(秒);
+          有帶就在派工前確認「本月已用量 + 長度」不超過上限(``quota_insufficient``)。
+          不可信任,權威檢查由 Cloud Run 量測實際音訊後進行。
 
     回應語意同 ``align_lyrics``:``{"saved": True, "cached": True}`` 或
     ``{"saved": True, "queued": True}``;失敗以 HttpsError 回對應錯誤碼。
@@ -602,12 +653,8 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
     ):
         return {"saved": True, "cached": True}
 
-    if _monthly_quota_exceeded(uid):
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
-            message="本月自動對時/產生歌詞額度已用盡,請下個月再試。",
-            details={"code": "quota_exceeded"},
-        )
+    quota_seconds = _quota_seconds_for(uid)
+    _ensure_quota(uid, quota_seconds, _client_duration_seconds(data))
 
     audio = {"gcs": {"bucket": bucket, "object": obj}}
     if audio_format:
@@ -619,6 +666,9 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         "trackId": str(track_id),
         "title": title or "",
     }
+    # Cloud Run 量出實際長度後依此做權威的配額檢查;豁免帳號不帶 = 不限制。
+    if quota_seconds is not None:
+        payload["quotaSeconds"] = quota_seconds
     if language:
         payload["language"] = language
 
