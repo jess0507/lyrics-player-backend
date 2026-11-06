@@ -123,7 +123,7 @@ gcloud run deploy aeneas-align \
   --no-allow-unauthenticated
 
 # 2. 暫存音訊清理:App 上傳到 Firebase 預設 bucket 的 align/{uid}/**。
-#    後端不即時刪除,完全交給 lifecycle:align/ 前綴 1 天後自動刪
+#    後端不即時刪除,完全交給 lifecycle:align/、generate/ 前綴 30 天後自動刪
 #    (涵蓋成功與失敗路徑)。僅限 align/ 前綴,不影響 bucket 內其他檔案。
 gcloud storage buckets update gs://<DEFAULT_FIREBASE_BUCKET> \
   --lifecycle-file=storage-lifecycle.json

@@ -3,8 +3,8 @@
     {
       "action": { "type": "Delete" },
       "condition": {
-        "age": 1,
-        "matchesPrefix": ["align/"]
+        "age": 30,
+        "matchesPrefix": ["align/", "generate/"]
       }
     }
   ]

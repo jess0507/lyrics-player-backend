@@ -40,7 +40,7 @@
         ```
      - Cloud Tasks 之後派工、真的打去 Cloud Run(這是另一件事,權限之前就已經設好了)
   6. Firebase 預設 Storage bucket(seek-player-f724e.firebasestorage.app)套用一條生命週期規則:
-  - 內容(aeneas_service/storage-lifecycle.json):凡是路徑前綴為 align/ 的物件,超過 1 天自動刪除。
+  - 內容(aeneas_service/storage-lifecycle.json):凡是路徑前綴為 align/ 或 generate/ 的物件,超過 30 天自動刪除。
     ```bash
     gcloud storage buckets update gs://seek-player-f724e.firebasestorage.app \                                                                                                                                                             
         --lifecycle-file=aeneas_service/storage-lifecycle.json
