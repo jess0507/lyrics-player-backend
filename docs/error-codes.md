@@ -13,6 +13,7 @@
 |---|---|---|
 | `service_unavailable` | 對應的 Cloud Run 服務未設定(缺 `ALIGN_SERVICE_URL` / `WHISPERX_SERVICE_URL`) | `internal` |
 | `invalid_request` | 缺必填欄位(`lines` / `bucket` / `object` / `jobId`;已發佈版 client(<= v1.2.17)沒帶 `jobId` 時,40 碼 hex 或純數字的 `trackId` 也算數) | `invalid-argument` |
+| `upgrade_required` | App 版本過舊:帶了已不支援的參數(`trackMd5` / `lyricsMd5` / `fingerprint`),或沒帶 `jobId` 且 `trackId` 不是 40 碼 hex / 純數字 / 空值;`details.params` 列出不支援的參數。App 應提示使用者更新版本 | `failed-precondition` |
 | `busy` | 同一首歌同任務種類(同 `trackId`(音檔 SHA-256)+ `kind`)仍在處理中;`details.activeTitle` 為曲名 | `failed-precondition` |
 | `quota_exceeded` | 本月額度(對時 + 自動產生合併計算,預設 60 分鐘)已用盡 | `resource-exhausted` |
 | `quota_insufficient` | client 帶了 `durationSeconds`,且「本月已用量 + 這段音訊長度」超過上限;`details.remainingSeconds` / `details.durationSeconds` 為剩餘額度與音訊長度(秒) | `resource-exhausted` |

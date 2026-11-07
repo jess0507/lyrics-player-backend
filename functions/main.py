@@ -147,15 +147,40 @@ def _resolve_job_and_track_id(data: dict) -> tuple[str | None, str | None]:
       (``trackId`` 是 sha1 指紋或 MediaStore id、兼當文件 id),沿用舊行為拿它
       當文件 id。這種請求拿不到音檔
       SHA-256,就不查沿用(``trackId`` 回 None),只靠文件本身的快照判斷。
-    - 其餘:文件 id 回 None,由呼叫端回 ``invalid_request``。
+    - 沒 ``jobId``、``trackId`` 有值但不是上述格式:丟 ``upgrade_required``。
+    - 兩者都沒帶:文件 id 回 None,由呼叫端回 ``invalid_request``。
+
+    帶了已不再支援的參數(見 ``_UNSUPPORTED_PARAMS``)一律丟
+    ``upgrade_required``。
     """
+    unsupported = sorted(k for k in _UNSUPPORTED_PARAMS if k in data)
+    if unsupported:
+        _raise_upgrade_required(unsupported)
     job_id = data.get("jobId")
     raw_track_id = data.get("trackId")
     if job_id:
         return str(job_id), _valid_sha256(raw_track_id)
     if isinstance(raw_track_id, str) and _LEGACY_TRACK_ID_PATTERN.match(raw_track_id):
         return raw_track_id, None
+    if raw_track_id not in (None, ""):
+        _raise_upgrade_required(["trackId"])
     return None, None
+
+
+# 已不再支援的 callable 參數:只出現在未發佈的開發版 client(MD5 / 頭尾指紋
+# 識別),收到代表 client 版本過舊,請使用者更新 App。
+_UNSUPPORTED_PARAMS = frozenset({"trackMd5", "lyricsMd5", "fingerprint"})
+
+
+def _raise_upgrade_required(params: list[str]) -> None:
+    """client 送了後端已不支援的參數 / 格式:回 ``failed-precondition``
+    (``details.code = "upgrade_required"``),由 App 提示使用者更新版本。
+    ``details.params`` 列出不支援的參數,方便 log 追查。"""
+    raise https_fn.HttpsError(
+        code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+        message="此版本的 App 已不支援這項功能,請更新到最新版本。",
+        details={"code": "upgrade_required", "params": params},
+    )
 
 
 def _lines_sha256(lines: list) -> str:
