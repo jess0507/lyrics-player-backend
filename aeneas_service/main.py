@@ -264,7 +264,7 @@ def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None
         .collection("lyrics")
         .document(track_id)
     )
-    # merge:保留派工時 functions/main.py 寫入的 ``trackMd5`` / ``lyricsMd5`` / ``kind``
+    # merge:保留派工時 functions/main.py 寫入的 ``trackId``(音檔 SHA-256)/ ``lyricsSha256`` / ``kind``
     # (同一首歌沿用結果時據此比對);``error`` 明確清掉,避免 Cloud Tasks
     # 重試前的失敗殘留在成功的文件上。
     doc_ref.set(
