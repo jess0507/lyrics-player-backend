@@ -10,11 +10,13 @@
    時間軸串接 → 推論記憶體與歌長無關。(不可把整首歌當單一 segment 餵
    `whisperx.align`:wav2vec2 一次 forward 整段音訊,attention 記憶體隨長度
    平方成長,2 分多鐘的歌即超過 8GiB,Cloud Run 直接 OOM。)
-3. 把所有歌詞行串接成完整文字,對串接後的 emissions 做**一次** CTC forced
+3. 各行先做對齊用正規化(NFKC / 中文繁 → 簡 / 遮蔽段落標籤與 credits,與原文
+   逐字等長,見 `lyrics_text.py`),再串接成完整文字,對 emissions 做**一次** CTC forced
    alignment(`torchaudio.functional.forced_align`,Viterbi 記憶體僅
    O(幀數 × token 數)),得到**字級**時間戳。
 4. char 串流與串接文字逐字對應;依各行在串接文字中的字元範圍切片,取每行
-   第一個有時間的字元為 begin、最後一個為 end,組回逐行片段 → LRC。
+   第一個有時間的字元為 begin、最後一個為 end,組回逐行片段 → LRC。過長的行
+   先依標點 / 停頓 / 長度切短(``ALIGN_SPLIT_LINES``,預設開)。
 
 whisperx 與其 torch / wav2vec2 依賴較重,故 ``import whisperx`` 延後到實際對齊時,
 讓 LRC 等純邏輯(`lrc.py`)與 :func:`build_fragments` 的單元測試不必載入重依賴。
@@ -28,6 +30,12 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from lrc import build_lrc
+from lyrics_text import (
+    ALIGN_SPLIT_LINES,
+    is_annotation_line,
+    normalize_for_alignment,
+    split_aligned_lines,
+)
 
 log = logging.getLogger(__name__)
 
@@ -294,12 +302,17 @@ def tokenize_text(
     """
     token_ids: List[int] = []
     char_indices: List[int] = []
+    delimiter_id = dictionary.get("|")
     for i, ch in enumerate(text):
         key = ch.lower()
         if key == " " and "|" in dictionary:
             key = "|"
         tid = dictionary.get(key)
         if tid is None or tid == blank_id:
+            continue
+        # 詞界 token 不放開頭、不連續出現(遮蔽內容 / 多重空白會留下相鄰空格,
+        # 多餘的 "|" 會逼 forced path 在音訊中硬塞停頓)。
+        if tid == delimiter_id and (not token_ids or token_ids[-1] == delimiter_id):
             continue
         token_ids.append(tid)
         char_indices.append(i)
@@ -467,7 +480,13 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
     log.info("對齊模型就緒(載入耗時 %.1fs)", time.perf_counter() - t_load)
 
     separator = separator_for(lang)
-    text = separator.join(clean)
+    # 對齊用文字(NFKC / 繁 → 簡 / 遮蔽不唱內容),與原文逐字等長,
+    # 字級時間戳仍以原文的字元位置對回;顯示與回傳一律用原文。
+    norm_lines = [normalize_for_alignment(line, lang) for line in clean]
+    text = separator.join(norm_lines)
+    changed = sum(1 for a, b in zip(clean, norm_lines) if a != b)
+    if changed:
+        log.info("對齊前正規化:%d/%d 行有變更", changed, len(clean))
 
     t_align = time.perf_counter()
     try:
@@ -482,11 +501,19 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
     if not any(c.get("start") is not None for c in chars):
         raise AlignmentError("對齊未產出任何字級時間")
 
-    fragments, timed = build_fragments(clean, chars, separator)
-    coverage = timed / len(clean)
+    out_lines, out_chars = clean, chars
+    if ALIGN_SPLIT_LINES:
+        out_lines, out_chars = split_aligned_lines(clean, chars, separator)
+        if len(out_lines) != len(clean):
+            log.info("切長行:%d 行 → %d 行", len(clean), len(out_lines))
+
+    fragments, timed = build_fragments(out_lines, out_chars, separator)
+    # 覆蓋率只計會唱的行;段落標籤 / credits 等整行遮蔽,本來就不會有時間。
+    singable = sum(1 for line in out_lines if not is_annotation_line(line)) or 1
+    coverage = timed / singable
     if coverage < _MIN_COVERAGE:
         raise AlignmentError(
-            f"對齊覆蓋率過低({timed}/{len(clean)}),保留原文字"
+            f"對齊覆蓋率過低({timed}/{singable}),保留原文字"
         )
 
     return {

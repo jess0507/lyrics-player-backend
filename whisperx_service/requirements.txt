@@ -13,3 +13,5 @@ numpy<2.0
 torch==2.2.2
 torchaudio==2.2.2
 whisperx==3.1.5
+# 對齊前中文繁 → 簡(zh 對齊模型字典只有簡體字;純 Python,見 lyrics_text.py)。
+opencc-python-reimplemented==0.1.7

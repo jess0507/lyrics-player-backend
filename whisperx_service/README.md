@@ -34,7 +34,8 @@ firebase deploy --only functions:align_lyrics
 | `main.py` | Flask app:`/healthz`、`/align` 端點;音訊取得(GCS / inline)。 |
 | `aligner.py` | WhisperX 對齊核心:純文字 + 音訊 → 字級時間 → 逐行 begin/end 秒。 |
 | `lrc.py` | 對齊秒數 → 標準 LRC(`[mm:ss.xx]`),純函式。 |
-| `test_lrc.py` / `test_align.py` | 純邏輯單元測試(免 whisperx / torch / ffmpeg / GCS)。 |
+| `lyrics_text.py` | 對齊前正規化(繁 → 簡 / NFKC / 遮蔽不唱內容)與切長行,純函式。 |
+| `test_lrc.py` / `test_align.py` / `test_lyrics_text.py` | 純邏輯單元測試(免 whisperx / torch / ffmpeg / GCS)。 |
 | `Dockerfile` | Python 3.11 + ffmpeg + torch(CPU)+ whisperx 的建置。 |
 | `requirements.txt` | Python 依賴(版本對 torch 敏感,勿隨意升級)。 |
 
@@ -100,6 +101,20 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 
 > 失敗一律不回半套時間。對齊覆蓋率(取得起始時間的行數佔比)低於
 > `WHISPERX_MIN_COVERAGE`(預設 0.6)時回 `alignment_failed`,App 保留原文字。
+> 覆蓋率只計會唱的行(段落標籤 / credits 行不計)。
+
+**對齊前正規化**(`lyrics_text.py`,只影響對齊,`lrc` 文字維持原文):
+- 中文繁 → 簡(OpenCC 逐字):zh 對齊模型字典只有 3503 個簡體字,常用繁體字
+  多半不在字典、取不到時間。
+- NFKC:全形英數 → 半形。
+- 遮蔽不唱的內容:`[Chorus]` / `(副歌)` / `Verse 1:` 等段落標籤、`作詞:` /
+  `Lyrics by:` 等 credits、`[ar:…]` metadata、殘留 LRC 時間戳、`(x2)` / `×3`。
+  這些行保留在輸出中,時間沿用前一行。
+
+**切長行**(`ALIGN_SPLIT_LINES`,預設 `1`;設 `0` 關閉):行的單元數(中日文字數 /
+其他語言詞數)或時長超過上限時,依標點 → 換氣停頓 → 長度上限切短;短行即使含
+標點也不切。門檻與 `/transcribe` 共用(見下方「切行」表)。啟用時 `lrc` /
+`fragments` 的行數可能多於輸入 `lines`。
 
 ### `POST /transcribe`
 
@@ -134,13 +149,25 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 模型大小由 `WHISPER_MODEL_SIZE`(預設 `small`)、量化 `WHISPER_COMPUTE_TYPE`
 (預設 `int8`)控制;CPU 上 large 對長曲易逼近逾時,實測後再調。
 
+**切行**:whisperx 會把語音合併成最長約 30 秒的段,歌聲又少標點,原樣一段一行
+會讓單一時間點顯示一大段歌詞。對齊後依字級時間把段切成短行,門檻可用 env 調整:
+
+| env | 預設 | 說明 |
+|---|---|---|
+| `LYRICS_LINE_GAP_SECONDS` | `0.6` | 相鄰兩字(詞)間隔 ≥ 此秒數就換行(換氣停頓,主規則) |
+| `LYRICS_LINE_MAX_CHARS_CJK` | `14` | 中 / 日文一行最多字數 |
+| `LYRICS_LINE_MAX_WORDS` | `10` | 其他語言一行最多詞數 |
+| `LYRICS_LINE_MAX_SECONDS` | `7` | 一行最長秒數,超過強制換行 |
+
+對齊失敗(退回 ASR 段級時間、無字級時間)時不切行。
+
 ## 本機驗證
 
 純邏輯(LRC 格式化、字級→逐行映射),不需任何重依賴:
 
 ```bash
 cd whisperx_service
-python -m unittest test_lrc test_align test_transcribe
+python -m unittest test_lrc test_align test_transcribe test_lyrics_text
 ```
 
 帶重依賴的本機品質測試(免容器 / GCS,直接跑對齊或自動產生):

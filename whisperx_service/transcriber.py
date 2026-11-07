@@ -12,7 +12,8 @@ WhisperX 標準管線本就是「transcribe → align」兩段,align 後半已�
    逐段(segment)文字與時間,**語言預設自動偵測**(歌聲場景不強制鎖定)。
 2. 以偵測語言載入對齊模型,`whisperx.align(...)` 精修每段時間(失敗則退回
    ASR 段級時間,不致整批失敗)。
-3. 每段文字即一「行」→ 組 LRC。
+3. 依字級時間把長段切成短行(停頓 / 字數 / 時長門檻,見 :func:`split_segments_into_lines`)
+   → 組 LRC。
 
 whisperx / torch 等重依賴延後到實際轉寫時才 import,讓 :func:`segments_to_fragments`
 等純邏輯(及其單元測試)無須載入重依賴。
@@ -25,8 +26,14 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from aligner import _load_align_model, normalize_language
+from aligner import _load_align_model, normalize_language, separator_for
 from lrc import build_lrc
+from lyrics_text import (
+    LINE_GAP_SECONDS,
+    LINE_MAX_CHARS_CJK,
+    LINE_MAX_SECONDS,
+    LINE_MAX_WORDS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +90,113 @@ def segments_to_fragments(segments: List[dict]) -> List[dict]:
             {"index": len(fragments), "begin": begin, "end": end, "text": text}
         )
     return fragments
+
+
+def _word_time(word: dict, key: str) -> Optional[float]:
+    """取字級時間(秒);缺漏或非數值回 None(數字等字典外字元常無時間)。"""
+    value = word.get(key)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_segment(
+    seg: dict,
+    separator: str,
+    max_units: int,
+    gap_seconds: float,
+    max_seconds: float,
+) -> List[dict]:
+    """依字級時間把單一 segment 切成多個子段(``{text, start, end}``)。
+
+    換行條件(目前行非空時,在下一個字之前斷開):
+    - 與前一個有時間的字間隔 ≥ ``gap_seconds``(換氣停頓);
+    - 目前行字(詞)數已達 ``max_units``;
+    - 加入此字後行長(首字 start → 此字 end)> ``max_seconds``。
+
+    無 ``words`` 時原樣回傳。子段缺時間時,首段沿用原段 ``start``、末段沿用原段
+    ``end``,其餘交給 :func:`segments_to_fragments` 沿用前一行時間。
+    """
+    words = seg.get("words") or []
+    if not words:
+        return [seg]
+
+    lines: List[List[dict]] = []
+    current: List[dict] = []
+    line_start: Optional[float] = None
+    prev_end: Optional[float] = None
+    for word in words:
+        text = str(word.get("word") or "").strip()
+        if not text:
+            continue
+        w_start = _word_time(word, "start")
+        w_end = _word_time(word, "end")
+        if current:
+            gap_break = (
+                w_start is not None
+                and prev_end is not None
+                and w_start - prev_end >= gap_seconds
+            )
+            length_break = len(current) >= max_units
+            duration_break = (
+                line_start is not None
+                and w_end is not None
+                and w_end - line_start > max_seconds
+            )
+            if gap_break or length_break or duration_break:
+                lines.append(current)
+                current, line_start = [], None
+        current.append({"text": text, "start": w_start, "end": w_end})
+        if line_start is None and w_start is not None:
+            line_start = w_start
+        if w_end is not None:
+            prev_end = w_end
+    if current:
+        lines.append(current)
+    if not lines:
+        return [seg]
+
+    out: List[dict] = []
+    for line in lines:
+        starts = [w["start"] for w in line if w["start"] is not None]
+        ends = [w["end"] for w in line if w["end"] is not None]
+        out.append(
+            {
+                "text": separator.join(w["text"] for w in line),
+                "start": starts[0] if starts else None,
+                "end": ends[-1] if ends else None,
+            }
+        )
+    if out[0]["start"] is None:
+        out[0]["start"] = seg.get("start")
+    if out[-1]["end"] is None:
+        out[-1]["end"] = seg.get("end")
+    return out
+
+
+def split_segments_into_lines(
+    segments: List[dict],
+    language: str,
+    gap_seconds: float = LINE_GAP_SECONDS,
+    max_chars_cjk: int = LINE_MAX_CHARS_CJK,
+    max_words: int = LINE_MAX_WORDS,
+    max_seconds: float = LINE_MAX_SECONDS,
+) -> List[dict]:
+    """把對齊後的長段依字級時間(``words``)切成短行(純函式,可單元測試)。
+
+    中 / 日文的 ``words`` 為逐字、以空字串串接並以字數計上限;其餘語言為逐詞、
+    以空格串接並以詞數計上限。無 ``words`` 的段(如對齊失敗退回 ASR 段級時間)
+    原樣保留。
+    """
+    separator = separator_for(language)
+    max_units = max_chars_cjk if separator == "" else max_words
+    out: List[dict] = []
+    for seg in segments:
+        out.extend(
+            _split_segment(seg, separator, max_units, gap_seconds, max_seconds)
+        )
+    return out
 
 
 def _load_asr_model():
@@ -182,7 +296,11 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
             exc,
         )
 
-    fragments = segments_to_fragments(segments)
+    # 依字級時間切短行(無 words 的段原樣保留,故對齊失敗時等同不切)。
+    lines = split_segments_into_lines(segments, lang)
+    log.info("切行完成 段數=%d → 行數=%d", len(segments), len(lines))
+
+    fragments = segments_to_fragments(lines)
     if not fragments:
         raise TranscriptionError("轉寫結果無有效歌詞行")
 
