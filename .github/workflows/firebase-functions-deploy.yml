@@ -1,7 +1,8 @@
 name: Deploy Cloud Functions
 
-# 當 master 上的 functions/、Firestore rules 或 Firebase 設定變更時，
-# 部署 Cloud Functions 與 Firestore security rules。
+# 當 master 上的 functions/、Firestore / Storage rules 或 Firebase 設定變更時，
+# 部署 Cloud Functions 與 Firestore / Storage security rules。
+# 規則只維護在本 repo(App repo seek_player 已移除副本),避免兩邊互相覆蓋。
 # 也可在 Actions 頁手動觸發（workflow_dispatch）。
 on:
   push:
@@ -10,6 +11,7 @@ on:
     paths:
       - "functions/**"
       - "firestore.rules"
+      - "storage.rules"
       - "firebase.json"
       - ".firebaserc"
       - ".github/workflows/firebase-functions-deploy.yml"
@@ -42,7 +44,7 @@ jobs:
         run: |
           echo "$FIREBASE_SA" > "$RUNNER_TEMP/sa.json"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
-          npx firebase-tools deploy --only functions,firestore:rules --project seek-player-f724e --non-interactive
+          npx firebase-tools deploy --only functions,firestore:rules,storage --project seek-player-f724e --non-interactive
 
       - name: Cleanup credentials
         if: always()
