@@ -13,7 +13,6 @@ on:
       - master
     paths:
       - "whisperx_service/**"
-      - ".github/workflows/cloud-run-whisperx-deploy.yml"
   workflow_dispatch:
 
 jobs:

@@ -5,8 +5,9 @@ name: Deploy Cloud Functions
 # - functions/**       → functions
 # - firestore.rules    → firestore:rules
 # - storage.rules      → storage
-# - firebase.json、.firebaserc、本 workflow 檔 → 全部（設定影響所有目標）
-# 手動觸發（workflow_dispatch）一律部署全部。
+# - firebase.json、.firebaserc → 全部（設定影響所有目標）
+# 只改本 workflow 檔不會觸發部署；要驗證 workflow 請手動觸發
+# （Actions 頁 → Deploy Cloud Functions → Run workflow），手動觸發一律部署全部。
 # 規則只維護在本 repo（App repo seek_player 已移除副本），避免兩邊互相覆蓋。
 on:
   push:
@@ -18,7 +19,6 @@ on:
       - "storage.rules"
       - "firebase.json"
       - ".firebaserc"
-      - ".github/workflows/firebase-functions-deploy.yml"
   workflow_dispatch:
 
 jobs:
@@ -56,9 +56,9 @@ jobs:
 
           has() { echo "$changed" | grep -qE "$1"; }
 
-          if [ "$all" = false ] && has '^(firebase\.json|\.firebaserc|\.github/workflows/firebase-functions-deploy\.yml)$'; then
+          if [ "$all" = false ] && has '^(firebase\.json|\.firebaserc)$'; then
             all=true
-            echo "Firebase 設定或 workflow 有變更，部署全部"
+            echo "Firebase 設定有變更，部署全部"
           fi
 
           targets=()

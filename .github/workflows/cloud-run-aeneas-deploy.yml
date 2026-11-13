@@ -12,7 +12,6 @@ on:
       - master
     paths:
       - "aeneas_service/**"
-      - ".github/workflows/cloud-run-aeneas-deploy.yml"
   workflow_dispatch:
 
 jobs:
