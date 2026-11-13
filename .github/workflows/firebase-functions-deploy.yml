@@ -1,9 +1,13 @@
 name: Deploy Cloud Functions
 
 # 當 master 上的 functions/、Firestore / Storage rules 或 Firebase 設定變更時，
-# 部署 Cloud Functions 與 Firestore / Storage security rules。
-# 規則只維護在本 repo(App repo seek_player 已移除副本),避免兩邊互相覆蓋。
-# 也可在 Actions 頁手動觸發（workflow_dispatch）。
+# 只部署有改動的部分（Functions / Firestore rules / Storage rules 分開判斷）：
+# - functions/**       → functions
+# - firestore.rules    → firestore:rules
+# - storage.rules      → storage
+# - firebase.json、.firebaserc、本 workflow 檔 → 全部（設定影響所有目標）
+# 手動觸發（workflow_dispatch）一律部署全部。
+# 規則只維護在本 repo（App repo seek_player 已移除副本），避免兩邊互相覆蓋。
 on:
   push:
     branches:
@@ -22,29 +26,85 @@ jobs:
     name: Deploy functions
     runs-on: ubuntu-latest
     steps:
+      # 需要完整歷史才能比對這次 push 的所有 commit（before..after）。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 依這次 push 改到的檔案決定部署目標，輸出 targets（逗號分隔）與 functions（true/false）。
+      # 比對範圍是整次 push（github.event.before → github.sha），不是只看最後一個 commit。
+      # 無法比對時（手動觸發、新分支、force push 後 before 不在歷史中）→ 部署全部。
+      - name: Detect changed targets
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          all=false
+          if [ "$EVENT_NAME" != "push" ] \
+             || [ -z "$BEFORE" ] \
+             || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            all=true
+            echo "無法比對變更範圍（event=$EVENT_NAME），部署全部"
+          else
+            changed=$(git diff --name-only "$BEFORE" "$AFTER")
+            echo "本次 push 變更的檔案："
+            echo "$changed"
+          fi
+
+          has() { echo "$changed" | grep -qE "$1"; }
+
+          if [ "$all" = false ] && has '^(firebase\.json|\.firebaserc|\.github/workflows/firebase-functions-deploy\.yml)$'; then
+            all=true
+            echo "Firebase 設定或 workflow 有變更，部署全部"
+          fi
+
+          targets=()
+          if [ "$all" = true ]; then
+            targets=(functions firestore:rules storage)
+          else
+            has '^functions/' && targets+=(functions)
+            has '^firestore\.rules$' && targets+=(firestore:rules)
+            has '^storage\.rules$' && targets+=(storage)
+          fi
+
+          joined=$(IFS=,; echo "${targets[*]}")
+          echo "部署目標：${joined:-（無）}"
+          echo "targets=$joined" >> "$GITHUB_OUTPUT"
+          if [[ ",$joined," == *",functions,"* ]]; then
+            echo "functions=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "functions=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Python 版本須與 firebase.json 的 "runtime": "python312" 一致。
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.functions == 'true'
         with:
           python-version: "3.12"
 
-      # firebase CLI 部署前會用本地 venv 載入 main.py 探測函式，必須先建好。
+      # firebase CLI 部署前會用本地 venv 載入 main.py 探測函式，必須先建好（只部署規則時略過）。
       - name: Build functions venv
+        if: steps.changes.outputs.functions == 'true'
         run: |
           cd functions
           python -m venv venv
           venv/bin/pip install -r requirements.txt
 
-      # 憑證沿用 hosting 的 service account secret；若權限不足見
-      # tasks/account-deletion-cloud-functions.md 的「權限注意」。
+      # 憑證為 secret FIREBASE_SERVICE_ACCOUNT_SEEK_PLAYER_F724E，內容是
+      # firebase-adminsdk-fbsvc@seek-player-f724e.iam.gserviceaccount.com
+      # （需 cloudfunctions.admin、firebaserules.admin、firebasestorage.viewer 等角色）。
       - name: Deploy to Firebase
+        if: steps.changes.outputs.targets != ''
         env:
           FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SEEK_PLAYER_F724E }}
+          TARGETS: ${{ steps.changes.outputs.targets }}
         run: |
           echo "$FIREBASE_SA" > "$RUNNER_TEMP/sa.json"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
-          npx firebase-tools deploy --only functions,firestore:rules,storage --project seek-player-f724e --non-interactive
+          npx firebase-tools deploy --only "$TARGETS" --project seek-player-f724e --non-interactive
 
       - name: Cleanup credentials
         if: always()
