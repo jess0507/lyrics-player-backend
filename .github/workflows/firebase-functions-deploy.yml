@@ -1,7 +1,7 @@
 name: Deploy Cloud Functions
 
-# 當 master 上的 functions/、Firestore / Storage rules 或 Firebase 設定變更時，
-# 只部署有改動的部分（Functions / Firestore rules / Storage rules 分開判斷）：
+# 只有 push 版本 tag（如 1.0.1）才觸發；push 到 master 不再部署。
+# 比對「上一個 tag → 本 tag」之間的變更，只部署有改動的部分（Functions / Firestore rules / Storage rules 分開判斷）：
 # - functions/**       → functions
 # - firestore.rules    → firestore:rules
 # - storage.rules      → storage
@@ -9,16 +9,11 @@ name: Deploy Cloud Functions
 # 只改本 workflow 檔不會觸發部署；要驗證 workflow 請手動觸發
 # （Actions 頁 → Deploy Cloud Functions → Run workflow），手動觸發一律部署全部。
 # 規則只維護在本 repo（App repo seek_player 已移除副本），避免兩邊互相覆蓋。
+# tag push 時 GitHub 不套用 paths 篩選，由 Detect changed targets 判斷；都沒改到就不部署。
 on:
   push:
-    branches:
-      - master
-    paths:
-      - "functions/**"
-      - "firestore.rules"
-      - "storage.rules"
-      - "firebase.json"
-      - ".firebaserc"
+    tags:
+      - "*.*.*"
   workflow_dispatch:
 
 jobs:
@@ -26,31 +21,31 @@ jobs:
     name: Deploy functions
     runs-on: ubuntu-latest
     steps:
-      # 需要完整歷史才能比對這次 push 的所有 commit（before..after）。
+      # 需要完整歷史與 tags 才能找到上一個 tag 並比對。
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # 依這次 push 改到的檔案決定部署目標，輸出 targets（逗號分隔）與 functions（true/false）。
-      # 比對範圍是整次 push（github.event.before → github.sha），不是只看最後一個 commit。
-      # 無法比對時（手動觸發、新分支、force push 後 before 不在歷史中）→ 部署全部。
+      # 比對範圍是上一個 tag → 本 tag（github.sha）。
+      # 無法比對時（手動觸發、第一個 tag）→ 部署全部。
       - name: Detect changed targets
         id: changes
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
           all=false
-          if [ "$EVENT_NAME" != "push" ] \
-             || [ -z "$BEFORE" ] \
-             || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          prev=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            prev=$(git describe --tags --abbrev=0 "$AFTER^" 2>/dev/null || true)
+          fi
+          if [ -z "$prev" ]; then
             all=true
-            echo "無法比對變更範圍（event=$EVENT_NAME），部署全部"
+            echo "無上一個 tag 可比對（event=$EVENT_NAME），部署全部"
           else
-            changed=$(git diff --name-only "$BEFORE" "$AFTER")
-            echo "本次 push 變更的檔案："
+            changed=$(git diff --name-only "$prev" "$AFTER")
+            echo "$prev → $GITHUB_REF_NAME 變更的檔案："
             echo "$changed"
           fi
 

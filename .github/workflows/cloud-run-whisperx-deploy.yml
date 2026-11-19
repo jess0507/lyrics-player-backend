@@ -1,18 +1,20 @@
 name: Deploy whisperx align (Cloud Run)
 
-# 當 master 上的 whisperx_service/(歌詞自動對時容器,aeneas 路線的升級選項)變更
+# 當 whisperx_service/(歌詞自動對時容器,aeneas 路線的升級選項)變更
 # 時,以 Cloud Build 從原始碼建置並部署到 Cloud Run。也可手動觸發
 # (workflow_dispatch)。
 #
 # 與 aeneas 路線(cloud-run-aeneas-deploy.yml)/ functions 的 Firebase Functions
 # 部署互相獨立:兩個對齊容器可並存,由 align_lyrics 的 ALIGN_SERVICE_URL 決定當前
 # 採用哪條路線(見 whisperx_service/README.md「如何切換」)。
+#
+# 只有 push 版本 tag(如 1.0.1)才觸發;push 到 master 不再部署。
+# tag push 時 GitHub 不套用 paths 篩選,改由下方 Detect changes 比對「上一個 tag → 本 tag」
+# 是否動到 whisperx_service/,沒動到就跳過部署。找不到上一個 tag 或手動觸發 → 一律部署。
 on:
   push:
-    branches:
-      - master
-    paths:
-      - "whisperx_service/**"
+    tags:
+      - "*.*.*"
   workflow_dispatch:
 
 jobs:
@@ -20,21 +22,47 @@ jobs:
     name: Deploy whisperx-align
     runs-on: ubuntu-latest
     steps:
+      # 需要完整歷史與 tags 才能找到上一個 tag 並比對。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          prev=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            prev=$(git describe --tags --abbrev=0 "$GITHUB_SHA^" 2>/dev/null || true)
+          fi
+          if [ -z "$prev" ]; then
+            echo "無上一個 tag 可比對(event=$EVENT_NAME),部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$prev" "$GITHUB_SHA" -- whisperx_service/; then
+            echo "$prev → $GITHUB_REF_NAME 未變更 whisperx_service/,略過部署"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$prev → $GITHUB_REF_NAME 變更了 whisperx_service/,部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # 沿用 aeneas 路線的部署 SA(具 Cloud Run / Cloud Build / Artifact Registry /
       # Storage 部署權限)。
       - name: Authenticate to Google Cloud
+        if: steps.changes.outputs.deploy == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_RUN_DEPLOY_SA }}
 
       - name: Set up Cloud SDK
+        if: steps.changes.outputs.deploy == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       # --source 讓 Cloud Build 用 whisperx_service/Dockerfile 建置;
       # 記憶體 / CPU 高於 aeneas(wav2vec2 較重),CPU 推論、無需 GPU。
       - name: Deploy to Cloud Run
+        if: steps.changes.outputs.deploy == 'true'
         run: |
           gcloud run deploy whisperx-align \
             --source whisperx_service \

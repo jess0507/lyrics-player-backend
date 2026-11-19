@@ -1,17 +1,19 @@
 name: Deploy aeneas align (Cloud Run)
 
-# 當 master 上的 aeneas_service/(歌詞自動對時容器)變更時,
+# 當 aeneas_service/(歌詞自動對時容器)變更時,
 # 以 Cloud Build 從原始碼建置並部署到 Cloud Run。
 # 也可在 Actions 頁手動觸發(workflow_dispatch)。
 #
 # 與 functions/ 的 Firebase Functions 部署互相獨立(見
 # firebase-functions-deploy.yml);aeneas 需 espeak/ffmpeg 系統依賴,走自架容器。
+#
+# 只有 push 版本 tag(如 1.0.1)才觸發;push 到 master 不再部署。
+# tag push 時 GitHub 不套用 paths 篩選,改由下方 Detect changes 比對「上一個 tag → 本 tag」
+# 是否動到 aeneas_service/,沒動到就跳過部署。找不到上一個 tag 或手動觸發 → 一律部署。
 on:
   push:
-    branches:
-      - master
-    paths:
-      - "aeneas_service/**"
+    tags:
+      - "*.*.*"
   workflow_dispatch:
 
 jobs:
@@ -19,22 +21,48 @@ jobs:
     name: Deploy aeneas-align
     runs-on: ubuntu-latest
     steps:
+      # 需要完整歷史與 tags 才能找到上一個 tag 並比對。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          prev=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            prev=$(git describe --tags --abbrev=0 "$GITHUB_SHA^" 2>/dev/null || true)
+          fi
+          if [ -z "$prev" ]; then
+            echo "無上一個 tag 可比對(event=$EVENT_NAME),部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$prev" "$GITHUB_SHA" -- aeneas_service/; then
+            echo "$prev → $GITHUB_REF_NAME 未變更 aeneas_service/,略過部署"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$prev → $GITHUB_REF_NAME 變更了 aeneas_service/,部署"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # 認證用的 service account 需具備 Cloud Run / Cloud Build / Artifact
       # Registry / Storage(讀部署用 GCS)等部署權限。可沿用既有
       # FIREBASE_SERVICE_ACCOUNT_* secret 並補授權,或另設一組部署專用 SA。
       - name: Authenticate to Google Cloud
+        if: steps.changes.outputs.deploy == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_RUN_DEPLOY_SA }}
 
       - name: Set up Cloud SDK
+        if: steps.changes.outputs.deploy == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       # --source 讓 Cloud Build 用 aeneas_service/Dockerfile 建置;
       # 記憶體 / CPU / 逾時對齊 README 的部署建議。
       - name: Deploy to Cloud Run
+        if: steps.changes.outputs.deploy == 'true'
         run: |
           gcloud run deploy aeneas-align \
             --source aeneas_service \
