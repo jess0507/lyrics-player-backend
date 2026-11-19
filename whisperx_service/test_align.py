@@ -12,6 +12,7 @@ import unittest
 from aligner import (
     _chunk_bounds,
     build_fragments,
+    _script_units,
     detect_language,
     frame_spans,
     normalize_language,
@@ -75,9 +76,40 @@ class DetectLanguageTest(unittest.TestCase):
             detect_language(["我愛你 baby", "永遠不分離"], "zh-TW"), "zh"
         )
 
+    def test_chinese_song_with_long_english_chorus_stays_zh(self):
+        # 逐字母計時英文會壓過中文(110 漢字 vs 280 字母 → han 28.2% 判 en);
+        # 以單字計則 110 漢字 vs 60 單字(han 64.7%),中文為主。
+        zh_lines = ["我愛你愛到不怕死去活來"] * 10  # 11 字 × 10 = 110 漢字
+        en_lines = ["Baby never leave me alone tonight"] * 10  # 6 字(28 字母)× 10
+        self.assertEqual(detect_language(zh_lines + en_lines, "zh-TW"), "zh")
+
+    def test_english_song_with_few_chinese_words_stays_en(self):
+        lines = ["I will always love you my dear"] * 8 + ["我愛你"]
+        self.assertEqual(detect_language(lines, "zh-TW"), "en")
+
     def test_no_letters_uses_hint(self):
         self.assertEqual(detect_language(["123", "...", "!!"], "ja"), "ja")
         self.assertEqual(detect_language([], ""), "en")
+
+
+class ScriptUnitsTest(unittest.TestCase):
+    """拉丁字母以單字計、CJK / 諺文逐字計。"""
+
+    def test_latin_counts_words_not_letters(self):
+        self.assertEqual(_script_units(["Hello world"])["latin"], 2)
+
+    def test_apostrophe_and_hyphen_do_not_split_words(self):
+        self.assertEqual(_script_units(["Je t'aime rock-n-roll"])["latin"], 3)
+
+    def test_lines_are_not_glued_together(self):
+        # 行尾 "world" 與下行行首 "I" 不可被算成同一個單字。
+        self.assertEqual(_script_units(["Hello world", "I love"])["latin"], 4)
+
+    def test_mixed_line_counts_each_script(self):
+        counts = _script_units(["我愛你 baby", "사랑해"])
+        self.assertEqual(counts["han"], 3)
+        self.assertEqual(counts["latin"], 1)
+        self.assertEqual(counts["hangul"], 3)
 
 
 class BuildFragmentsTest(unittest.TestCase):

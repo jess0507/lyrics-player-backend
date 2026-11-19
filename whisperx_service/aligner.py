@@ -137,6 +137,36 @@ def _classify_char(ch: str) -> Optional[str]:
     return None
 
 
+# 拉丁單字內部可出現、不切斷單字的連接符(如 "t'aime"、"rock-n-roll")。
+_LATIN_WORD_JOINERS = {"'", "’", "-"}
+
+
+def _script_units(lines: List[str]) -> Dict[str, int]:
+    """各文字系統的**發音單元**數(純函式,可單元測試)。
+
+    諺文 / 假名 / 漢字每字約一個音節,逐字計;拉丁字母則以**單字**為單位
+    (連續字母算一個,內部的 ``'`` / ``-`` 不切斷)。若逐字母計,一個英文單字
+    抵好幾個漢字,中文為主、夾英文副歌的歌會被誤判成 en,中文整段對不到。
+    各行分開掃描,避免前行行尾與下行行首的字母被黏成同一個單字。
+    """
+    counts = {"hangul": 0, "kana": 0, "han": 0, "latin": 0}
+    for line in lines:
+        in_word = False
+        for ch in line:
+            kind = _classify_char(ch)
+            if kind == "latin":
+                if not in_word:
+                    counts["latin"] += 1
+                    in_word = True
+                continue
+            if in_word and ch in _LATIN_WORD_JOINERS:
+                continue
+            in_word = False
+            if kind is not None:
+                counts[kind] += 1
+    return counts
+
+
 def detect_language(lines: List[str], hint: str) -> str:
     """由歌詞的文字系統推定對齊語言;client 提示僅在不衝突時採用。
 
@@ -145,14 +175,11 @@ def detect_language(lines: List[str], hint: str) -> str:
     時間戳全空,故以歌詞字元為準:
     - 諺文佔比高 → ko;假名出現 → ja(先於漢字判定,日文歌詞漢字假名混寫);
       漢字佔比高 → zh;拉丁字母為主 → 提示屬拉丁語系則沿用提示,否則 en。
+    - 佔比以發音單元計(見 :func:`_script_units`:英文一個單字算一單元)。
     - 無法判定(純標點 / 數字等)→ 用正規化後的提示。
     """
     normalized_hint = normalize_language(hint)
-    counts = {"hangul": 0, "kana": 0, "han": 0, "latin": 0}
-    for ch in "".join(lines):
-        kind = _classify_char(ch)
-        if kind is not None:
-            counts[kind] += 1
+    counts = _script_units(lines)
     letters = sum(counts.values())
     if letters == 0:
         return normalized_hint
