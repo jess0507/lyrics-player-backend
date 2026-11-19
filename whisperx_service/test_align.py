@@ -11,6 +11,8 @@ import unittest
 
 from aligner import (
     _chunk_bounds,
+    _leading_untimed_units,
+    apply_lead,
     build_fragments,
     _script_units,
     detect_language,
@@ -171,6 +173,35 @@ class BuildFragmentsTest(unittest.TestCase):
         self.assertEqual(frags[0]["begin"], 0.0)
         self.assertEqual(frags[1]["begin"], 2.0)  # 0 + 4 * (2/4)
 
+    def test_leading_oov_chars_backfill_begin(self):
+        # "Baby我":英文字母不在 zh 字典 → 從「我」往回推 1 單元(0.3s)。
+        lines = ["ab", "Baby我"]
+        chars = [_char("a", 0.0, 1.0), _char("b", 1.0, 2.0)]
+        chars += [_char(c) for c in "Baby"] + [_char("我", 5.0, 5.5)]
+        frags, timed = build_fragments(lines, chars, "", oov_unit_seconds=0.3)
+        self.assertEqual(timed, 2)
+        self.assertAlmostEqual(frags[1]["begin"], 4.7)
+
+    def test_leading_oov_backfill_bounded_by_previous_char_end(self):
+        # 往回推不可早於前一個對齊到的字結束(2.0)。
+        lines = ["ab", "1234我"]
+        chars = [_char("a", 0.0, 1.0), _char("b", 1.0, 2.0)]
+        chars += [_char(c) for c in "1234"] + [_char("我", 2.5, 3.0)]
+        frags, _ = build_fragments(lines, chars, "", oov_unit_seconds=0.3)
+        self.assertEqual(frags[1]["begin"], 2.0)
+
+    def test_leading_punct_and_mask_do_not_backfill(self):
+        lines = ["「\x00我"]
+        chars = [_char("「"), _char("\x00"), _char("我", 3.0, 3.5)]
+        frags, _ = build_fragments(lines, chars, "", oov_unit_seconds=0.3)
+        self.assertEqual(frags[0]["begin"], 3.0)
+
+    def test_backfill_disabled_with_zero(self):
+        lines = ["Baby我"]
+        chars = [_char(c) for c in "Baby"] + [_char("我", 5.0, 5.5)]
+        frags, _ = build_fragments(lines, chars, "", oov_unit_seconds=0)
+        self.assertEqual(frags[0]["begin"], 5.0)
+
     def test_no_timing_at_all_returns_zeroed(self):
         lines = ["ab"]
         chars = [_char("a"), _char("b")]
@@ -239,6 +270,47 @@ class ChunkBoundsTest(unittest.TestCase):
 
     def test_single_short_chunk(self):
         self.assertEqual(_chunk_bounds(8000, 16000), [0, 8000])
+
+
+
+class LeadingUntimedUnitsTest(unittest.TestCase):
+    def test_latin_runs_count_by_syllable_estimate(self):
+        self.assertEqual(_leading_untimed_units("Baby "), 1)
+        self.assertEqual(_leading_untimed_units("tonight"), 2)
+        self.assertEqual(_leading_untimed_units("oh yeah "), 2)
+
+    def test_digits_and_cjk_count_each(self):
+        self.assertEqual(_leading_untimed_units("520"), 3)
+        self.assertEqual(_leading_untimed_units("龘"), 1)
+
+    def test_punct_space_mask_count_zero(self):
+        self.assertEqual(_leading_untimed_units("「 \x00,"), 0)
+
+
+class ApplyLeadTest(unittest.TestCase):
+    def _frags(self, *spans):
+        return [
+            {"index": i, "begin": b, "end": e, "text": str(i)}
+            for i, (b, e) in enumerate(spans)
+        ]
+
+    def test_shifts_begin_and_keeps_end(self):
+        frags = apply_lead(self._frags((1.0, 2.0), (3.0, 4.0)), 0.2)
+        self.assertAlmostEqual(frags[0]["begin"], 0.8)
+        self.assertAlmostEqual(frags[1]["begin"], 2.8)
+        self.assertEqual(frags[1]["end"], 4.0)
+
+    def test_clamps_at_zero_and_stays_monotonic(self):
+        frags = apply_lead(self._frags((0.1, 0.1), (0.1, 0.1), (0.2, 0.3)), 0.2)
+        self.assertEqual([f["begin"] for f in frags], [0.0, 0.0, 0.0])
+
+    def test_end_not_before_begin(self):
+        frags = apply_lead(self._frags((2.0, 2.0)), 0.5)
+        self.assertGreaterEqual(frags[0]["end"], frags[0]["begin"])
+
+    def test_zero_lead_is_noop(self):
+        frags = apply_lead(self._frags((1.0, 2.0)), 0)
+        self.assertEqual(frags[0]["begin"], 1.0)
 
 
 if __name__ == "__main__":

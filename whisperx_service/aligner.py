@@ -16,7 +16,10 @@
    O(幀數 × token 數)),得到**字級**時間戳。
 4. char 串流與串接文字逐字對應;依各行在串接文字中的字元範圍切片,取每行
    第一個有時間的字元為 begin、最後一個為 end,組回逐行片段 → LRC。過長的行
-   先依標點 / 停頓 / 長度切短(``ALIGN_SPLIT_LINES``,預設開)。
+   先依標點 / 停頓 / 長度切短(``ALIGN_SPLIT_LINES``,預設開)。行首有字典外
+   的字(中文歌的英文字 / 數字)時依發音單元數往回推起點。
+5. 每行起點再提前 ``ALIGN_LEAD_SECONDS``(預設 0.2 秒):CTC 標的是模型最確定
+   的幀(多半是母音)而非開口瞬間,加上顯示需要一點提前量,不提前會慢半拍。
 
 whisperx 與其 torch / wav2vec2 依賴較重,故 ``import whisperx`` 延後到實際對齊時,
 讓 LRC 等純邏輯(`lrc.py`)與 :func:`build_fragments` 的單元測試不必載入重依賴。
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -50,6 +54,18 @@ _MIN_COVERAGE = float(os.environ.get("WHISPERX_MIN_COVERAGE", "0.6"))
 # 20 秒與 /transcribe 路線逐段對齊的段長(whisper 段 ≤30 秒,同容器可正常跑)
 # 同量級。調大可些微增加跨塊上下文,但同時放大記憶體峰值。可用環境變數覆寫。
 _CHUNK_SECONDS = float(os.environ.get("WHISPERX_CHUNK_SECONDS", "20"))
+
+# 顯示提前量(秒):每行 LRC 起點往前移這麼多。CTC 會把字標在模型最確定的
+# 幀(多半是母音),比實際開口(聲母)晚;歌詞恰在開口瞬間才出現也會讓人覺得
+# 慢半拍。設 0 關閉。
+ALIGN_LEAD_SECONDS = float(os.environ.get("ALIGN_LEAD_SECONDS", "0.2"))
+
+# 行首字典外字元(中文歌裡的英文字 / 數字、生僻字)每個發音單元估計的秒數,
+# 用來把該行起點從第一個有時間的字往回推(見 :func:`_leading_untimed_units`)。
+ALIGN_OOV_UNIT_SECONDS = float(os.environ.get("ALIGN_OOV_UNIT_SECONDS", "0.3"))
+
+# 拉丁字母串:約每 3 個字母算一個發音單元("Baby" → 1、"tonight" → 2)。
+_LATIN_RUN_RE = re.compile(r"[A-Za-z'’]+")
 
 
 class AlignmentError(Exception):
@@ -208,6 +224,7 @@ def build_fragments(
     lines: List[str],
     chars: List[dict],
     separator: str,
+    oov_unit_seconds: float = ALIGN_OOV_UNIT_SECONDS,
 ) -> Tuple[List[dict], int]:
     """把字級 char alignments 依各行字元範圍切回逐行片段(純函式,可單元測試)。
 
@@ -216,6 +233,7 @@ def build_fragments(
         chars: whisperx 的字級對齊串流,逐元素 ``{"char","start","end",...}``,
                順序與串接文字一致;無法對齊的字元其 ``start`` / ``end`` 可能缺漏。
         separator: 串接各行所用的分隔字元(見 :func:`separator_for`)。
+        oov_unit_seconds: 行首字典外字元每發音單元的估計秒數(0 = 不補時)。
 
     回傳 ``(fragments, timed_count)``:``fragments`` 為
     ``[{index, begin, end, text}, ...]``(秒);``timed_count`` 為實際取得起始
@@ -243,17 +261,32 @@ def build_fragments(
 
     fragments: List[dict] = []
     last_end = 0.0
+    # 前面最後一個「有時間」的字的結束時間;行首補時不可早於此(只看實際對齊到
+    # 的字,不看整行無時間、沿用前值的行)。
+    prev_timed_end = 0.0
     timed = 0
     for i, (s, e) in enumerate(ranges):
         begin: Optional[float] = None
         end: Optional[float] = None
-        for c in chars[s:e]:
+        first_timed = None
+        for k, c in enumerate(chars[s:e]):
             cs = c.get("start")
             ce = c.get("end")
             if cs is not None and begin is None:
                 begin = float(cs)
+                first_timed = k
             if ce is not None:
                 end = float(ce)
+        if begin is not None and first_timed and oov_unit_seconds > 0:
+            # 行首有字典外的字(如中文歌的 "Baby 我…"):起點落在後面第一個有
+            # 時間的字會整行偏晚,依發音單元數往回推,但不早於前一個字結束。
+            units = _leading_untimed_units(
+                "".join(str(c.get("char") or "") for c in chars[s : s + first_timed])
+            )
+            if units:
+                begin = max(begin - units * oov_unit_seconds, prev_timed_end, 0.0)
+        if end is not None:
+            prev_timed_end = max(prev_timed_end, end)
         if begin is None:
             # 該行整行無時間:沿用前一行結束時間,保持 LRC 單調遞增。
             begin = last_end
@@ -268,6 +301,44 @@ def build_fragments(
             {"index": i, "begin": begin, "end": end, "text": lines[i]}
         )
     return fragments, timed
+
+
+def _leading_untimed_units(text: str) -> int:
+    """行首無時間片段的估計發音單元數(純函式)。
+
+    ``text`` 為對齊用(正規化後)字元:遮蔽字元、空白、標點不算;拉丁字母串
+    約每 3 字母一單元(至少 1);其餘字母 / 數字(漢字、假名、每位數字)各一單元。
+    """
+    units = 0
+    rest = []
+    pos = 0
+    for m in _LATIN_RUN_RE.finditer(text):
+        rest.append(text[pos : m.start()])
+        pos = m.end()
+        letters = sum(1 for ch in m.group() if ch.isalpha())
+        if letters:
+            units += max(1, round(letters / 3))
+    rest.append(text[pos:])
+    units += sum(1 for ch in "".join(rest) if ch.isalnum())
+    return units
+
+
+def apply_lead(fragments: List[dict], lead_seconds: float) -> List[dict]:
+    """把每行起點提前 ``lead_seconds``(純函式,原地修改並回傳)。
+
+    起點不小於 0、不早於上一行(調整後)的起點,維持 LRC 單調遞增;
+    ``end`` 不動(僅保證不小於 ``begin``)。
+    """
+    if lead_seconds <= 0:
+        return fragments
+    prev_begin = 0.0
+    for frag in fragments:
+        begin = max(float(frag["begin"]) - lead_seconds, prev_begin, 0.0)
+        frag["begin"] = begin
+        if float(frag["end"]) < begin:
+            frag["end"] = begin
+        prev_begin = begin
+    return fragments
 
 
 def _proportional_fragments(
@@ -535,6 +606,7 @@ def align(lines: List[str], audio_path: str, language: str) -> dict:
             log.info("切長行:%d 行 → %d 行", len(clean), len(out_lines))
 
     fragments, timed = build_fragments(out_lines, out_chars, separator)
+    apply_lead(fragments, ALIGN_LEAD_SECONDS)
     # 覆蓋率只計會唱的行;段落標籤 / credits 等整行遮蔽,本來就不會有時間。
     singable = sum(1 for line in out_lines if not is_annotation_line(line)) or 1
     coverage = timed / singable
