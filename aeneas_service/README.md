@@ -15,9 +15,11 @@ LRC。App 端拿回 LRC 後寫回同一個 `LyricsEntity`(`source = generated`�
 | 檔案 | 職責 |
 | --- | --- |
 | `main.py` | Flask app:`/healthz`、`/align` 端點;音訊取得(GCS / inline)。 |
-| `aligner.py` | aeneas 呼叫核心:純文字 + 音訊 → 逐行 begin/end 秒。 |
+| `aligner.py` | aeneas 呼叫核心:純文字 + 音訊 → 逐行 begin/end 秒;語言偵測、顯示行組裝。 |
+| `lyrics_text.py` | 歌詞文字前處理(純函式):註記 / 不唱內容、切行、文字系統統計。 |
 | `lrc.py` | 對齊秒數 → 標準 LRC(`[mm:ss.xx]`),純函式。 |
 | `test_lrc.py` | `lrc.py` 單元測試(免 aeneas / ffmpeg / GCS)。 |
+| `test_lyrics_text.py` | 前處理 / 語言偵測 / 顯示行組裝的單元測試(免 aeneas)。 |
 | `Dockerfile` | Python 3.8 + espeak + ffmpeg + aeneas 的建置。 |
 | `requirements.txt` | Python 依賴(版本對 aeneas 敏感,勿隨意升級)。 |
 
@@ -46,12 +48,49 @@ LRC。App 端拿回 LRC 後寫回同一個 `LyricsEntity`(`source = generated`�
 
 | 欄位 | 必填 | 說明 |
 | --- | --- | --- |
-| `lines` | ✓ | 純文字歌詞,每元素一行(**已去空行 / 修飾**)。後端會再濾掉空行,對齊結果與此清單一一對應。 |
-| `language` | | 客戶端語言碼(BCP-47 或二字母),後端正規化為 aeneas 的 ISO 639-3。預設 `eng`。常見:`zh*`→`cmn`、`ja`→`jpn`、`en`→`eng`。 |
+| `lines` | ✓ | 純文字歌詞,每元素一行。後端會濾掉空行,並可能**切行**(見下方「對齊前的文字處理」),所以回傳的 LRC 行數可能多於輸入。 |
+| `language` | | 客戶端語言碼(BCP-47 或二字母,通常是 App UI locale),**只當提示**:實際語言依歌詞文字系統偵測,見下方。預設 `eng`。 |
 | `audio` | ✓ | 音訊來源,二擇一:`gcs` 或 `inlineBase64`。 |
 | `audio.gcs` | | `{ bucket, object }`:從 Cloud Storage 下載(正式路線)。後端**不刪除**該物件,暫存音訊清理交給 bucket lifecycle(見部署)。 |
 | `audio.inlineBase64` | | base64 內嵌音訊,**僅供本機 / 小檔測試**(上限 50 MB)。 |
 | `audio.format` | | 副檔名提示(`opus` / `m4a` / `mp3` …);僅影響暫存檔名,實際解碼交給 ffmpeg。 |
+
+### 對齊前的文字處理
+
+aeneas 會用 espeak TTS 把每一行唸出來再跟音訊做 DTW,只產出「整行」時間。
+送進 aeneas 前,`lyrics_text.plan_lines` 把使用者的行拆成**顯示行**(輸出
+LRC 的每一行)與**對齊行**(實際送 aeneas 的 TTS 文字),兩者以索引對應;
+aeneas 的片段數檢查是對「對齊行」做。規則移植自 `whisperx_service/`(只搬
+不需要字級時間的部分)。
+
+1. **不唱的內容不送 aeneas**
+   - 整行註記(`[Chorus]`、`(副歌)`、`Verse 1`、`作詞：xxx`、`Lyrics by: xxx`、
+     `[ar:xxx]` 等)不送 aeneas,對完後插回原位置,時間**沿用前一行**(第一行
+     則 `00:00.00`)。沒有可唸內容的行(如單獨一行 `(x2)`)同樣處理。
+   - 行內的 LRC 時間戳 `[01:23.45]`、重複記號 `(x2)` / `×3`、行首段落標籤
+     `[Chorus] ...` 只從 TTS 文字移除,**顯示仍用原文**。
+   - TTS 文字另做 NFKC(全形英數 → 半形)。
+   - 全部是註記 / 空行 → `alignment_failed`(422)。
+2. **依歌詞文字系統偵測語言**:以發音單元計(拉丁以單字計,漢字 / 假名 /
+   諺文逐字計)。諺文 ≥ 30% → `kor`;假名 ≥ 10% → `jpn`;漢字 ≥ 30% → `cmn`
+   (提示為 `yue` 則沿用);拉丁 ≥ 50% → 提示屬拉丁語系(`eng`/`spa`/`fra`…)
+   則沿用,否則 `eng`;無法判定才用提示。與提示不同時記 info log。回應的
+   `language` 是實際使用的語言。
+3. **只看文字的切行**(`ALIGN_SPLIT_LINES`,預設開):
+   - 句末標點(`。．！？!?‼` 及句點)後必斷;`...`、小數點(`3.5`)、英文縮寫
+     (`Mr.`、`Dr.`、`U.S.`、單一大寫字母 `J.`)不算,但 `I.`、`no.` 算句尾。
+   - 斷完仍過長(中 / 日文 > 14 字,其他語言 > 10 詞)才在子句標點
+     (`，；：…` 等)斷,以片段貪婪合併,沒有子句標點就不硬切。
+   - 一行內語系只切換一次(拉丁 ↔ 其他,如 `Apple蘋果`、`Absorb,吸收.`、
+     `我愛你baby`)時在切換處斷;句中夾外文(`給我一個kiss吧`)不斷。數字中性,
+     標點跟前段。切出的片段若沒有可唸內容(如行尾 `(x2)`),併回前段。
+   - whisperx 的停頓 / 秒數規則需要字級時間,aeneas 無法做。
+
+| 環境變數 | 預設 | 說明 |
+| --- | --- | --- |
+| `ALIGN_SPLIT_LINES` | `1` | `0` / `false` 關閉切行(仍會移除註記與不唱內容)。 |
+| `LYRICS_LINE_MAX_CHARS_CJK` | `14` | 中 / 日文一行最多字數,超過才在子句標點斷。 |
+| `LYRICS_LINE_MAX_WORDS` | `10` | 其他語言一行最多詞數,超過才在子句標點斷。 |
 
 **音訊建議**:forced alignment 只需語音,App 端應**先壓成單聲道低取樣**
 (如 16 kHz mono opus)再經 GCS 中轉,大幅降低傳輸量與成本(見計畫決策)。
@@ -62,15 +101,16 @@ LRC。App 端拿回 LRC 後寫回同一個 `LyricsEntity`(`source = generated`�
 {
   "lrc": "[00:00.00]第一行歌詞\n[00:12.34]第二行歌詞",
   "fragments": [
-    { "index": 0, "begin": 0.0,  "end": 12.34, "text": "第一行歌詞" },
-    { "index": 1, "begin": 12.34, "end": 25.0,  "text": "第二行歌詞" }
+    { "index": 0, "begin": 0.0,  "end": 12.34, "text": "第一行歌詞", "aligned": true },
+    { "index": 1, "begin": 12.34, "end": 25.0,  "text": "第二行歌詞", "aligned": true }
   ],
   "language": "cmn"
 }
 ```
 
 App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
-`source = generated`)。`fragments` 供除錯 / 信心評估用。
+`source = generated`)。`fragments` 與 LRC 行一一對應,供除錯 / 信心評估用;
+`aligned: false` 表示該行沒送 aeneas(註記等),時間沿用前一行。
 
 **錯誤**(HTTP 狀態 + `{"error": {"code", "message"}}`):
 
@@ -85,11 +125,11 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 
 ## 本機驗證
 
-純邏輯(LRC 格式化),不需任何重依賴:
+純邏輯(LRC 格式化、文字前處理、語言偵測),不需任何重依賴:
 
 ```bash
 cd aeneas_service
-python -m unittest test_lrc
+python -m unittest test_lrc test_lyrics_text
 ```
 
 完整對齊需 aeneas + ffmpeg + espeak,建議直接在容器內測:
