@@ -7,6 +7,10 @@ import unittest
 
 from lyrics_text import (
     MASK_CHAR,
+    SCRIPT_SIMPLIFIED,
+    SCRIPT_TRADITIONAL,
+    convert_script,
+    output_script_for,
     is_annotation_line,
     normalize_for_alignment,
     split_aligned_lines,
@@ -139,6 +143,41 @@ class SplitAlignedLinesTest(unittest.TestCase):
         lines = ["abc"]
         chars = [_c("a")]
         self.assertEqual(_split(lines, chars, " "), (lines, chars))
+class OutputScriptTest(unittest.TestCase):
+    def test_traditional_hints(self):
+        for hint in ["zh-TW", "zh_HK", "zh-Hant", "zh-Hant-TW", "yue"]:
+            self.assertEqual(output_script_for(hint), SCRIPT_TRADITIONAL, hint)
+
+    def test_simplified_hints(self):
+        for hint in ["zh-CN", "zh-Hans", "zh-Hans-CN", "zh-SG"]:
+            self.assertEqual(output_script_for(hint), SCRIPT_SIMPLIFIED, hint)
+
+    def test_ambiguous_or_other_is_none(self):
+        for hint in [None, "", "zh", "en", "ja", "zh-twx"]:
+            self.assertIsNone(output_script_for(hint), hint)
+
+    def test_convert_none_is_identity(self):
+        self.assertEqual(convert_script("放弃", None), "放弃")
+
+
+try:
+    import opencc  # noqa: F401
+    _HAS_OPENCC = True
+except ImportError:
+    _HAS_OPENCC = False
+
+
+@unittest.skipUnless(_HAS_OPENCC, "需要 opencc(容器內有)")
+class ConvertScriptOpenCCTest(unittest.TestCase):
+    def test_simplified_to_traditional_whole_line(self):
+        self.assertEqual(convert_script("头发很长", SCRIPT_TRADITIONAL), "頭髮很長")
+
+    def test_traditional_to_simplified(self):
+        self.assertEqual(convert_script("頭髮很長", SCRIPT_SIMPLIFIED), "头发很长")
+
+    def test_mixed_line_unified(self):
+        self.assertEqual(convert_script("Abuse 濫用 虐待", SCRIPT_TRADITIONAL), "Abuse 濫用 虐待")
+        self.assertEqual(convert_script("Abandon 放弃", SCRIPT_TRADITIONAL), "Abandon 放棄")
 
 
 if __name__ == "__main__":

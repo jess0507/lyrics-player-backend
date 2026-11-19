@@ -477,6 +477,10 @@ def transcribe_endpoint():
 
     # 語言為選填提示;省略 → whisper 自動偵測。
     language = payload.get("language")
+    # 中文輸出字形(選填):"traditional" / "simplified";省略則由 language 推定。
+    script = payload.get("script")
+    if script not in ("traditional", "simplified"):
+        script = None
     audio = payload.get("audio")
     if not isinstance(audio, dict):
         return _fail(uid, track_id, "invalid_request", "需提供 audio 物件", 400)
@@ -544,7 +548,9 @@ def transcribe_endpoint():
         _write_status(str(uid), str(track_id), STATUS_TRANSCRIBING)
 
     try:
-        result = transcribe(audio_path, str(language) if language else None)
+        result = transcribe(
+            audio_path, str(language) if language else None, script=script
+        )
     except TranscriptionError as exc:
         # 記下「可預期失敗」的原因(辨識不出歌詞 / 音訊不可用),否則 422
         # 在 log 無痕,難以判斷是音訊問題還是模型沒抓到歌聲。

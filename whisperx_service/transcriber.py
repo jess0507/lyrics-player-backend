@@ -13,7 +13,10 @@ WhisperX 標準管線本就是「transcribe → align」兩段,align 後半已�
 2. 以偵測語言載入對齊模型,`whisperx.align(...)` 精修每段時間(失敗則退回
    ASR 段級時間,不致整批失敗)。
 3. 依字級時間把長段切成短行(停頓 / 字數 / 時長門檻,見 :func:`split_segments_into_lines`)
-   → 組 LRC。
+   → 組 LRC。行首無時間的字(字典外)依發音單元數往回推起點。
+4. 對齊時餵 NFKC / 繁 → 簡的副本(中文對齊模型字典只有簡體);輸出時整行轉成
+   client 要的字形(``script``,或由 ``zh-TW`` / ``zh-CN`` 推定),再把每行起點
+   提前 ``ALIGN_LEAD_SECONDS``(與 ``/align`` 共用)。
 
 whisperx / torch 等重依賴延後到實際轉寫時才 import,讓 :func:`segments_to_fragments`
 等純邏輯(及其單元測試)無須載入重依賴。
@@ -26,13 +29,24 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from aligner import _load_align_model, normalize_language, separator_for
+from aligner import (
+    ALIGN_LEAD_SECONDS,
+    ALIGN_OOV_UNIT_SECONDS,
+    _leading_untimed_units,
+    _load_align_model,
+    apply_lead,
+    normalize_language,
+    separator_for,
+)
 from lrc import build_lrc
 from lyrics_text import (
     LINE_GAP_SECONDS,
     LINE_MAX_CHARS_CJK,
     LINE_MAX_SECONDS,
     LINE_MAX_WORDS,
+    convert_script,
+    normalize_for_alignment,
+    output_script_for,
 )
 
 log = logging.getLogger(__name__)
@@ -107,6 +121,7 @@ def _split_segment(
     max_units: int,
     gap_seconds: float,
     max_seconds: float,
+    oov_unit_seconds: float = ALIGN_OOV_UNIT_SECONDS,
 ) -> List[dict]:
     """依字級時間把單一 segment 切成多個子段(``{text, start, end}``)。
 
@@ -117,6 +132,10 @@ def _split_segment(
 
     無 ``words`` 時原樣回傳。子段缺時間時,首段沿用原段 ``start``、末段沿用原段
     ``end``,其餘交給 :func:`segments_to_fragments` 沿用前一行時間。
+
+    子段開頭有無時間的字(字典外:中文裡的英文 / 數字等)時,起點依其發音單元數
+    × ``oov_unit_seconds`` 從第一個有時間的字往回推,不早於前一子段結束;
+    跨行的下限由 :func:`segments_to_fragments` 夾住。
     """
     words = seg.get("words") or []
     if not words:
@@ -158,16 +177,30 @@ def _split_segment(
         return [seg]
 
     out: List[dict] = []
+    prev_line_end: Optional[float] = None
     for line in lines:
         starts = [w["start"] for w in line if w["start"] is not None]
         ends = [w["end"] for w in line if w["end"] is not None]
+        start = starts[0] if starts else None
+        if start is not None and oov_unit_seconds > 0:
+            lead_words = []
+            for w in line:
+                if w["start"] is not None:
+                    break
+                lead_words.append(w["text"])
+            units = _leading_untimed_units(separator.join(lead_words))
+            if units:
+                floor = prev_line_end if prev_line_end is not None else 0.0
+                start = max(start - units * oov_unit_seconds, floor, 0.0)
         out.append(
             {
                 "text": separator.join(w["text"] for w in line),
-                "start": starts[0] if starts else None,
+                "start": start,
                 "end": ends[-1] if ends else None,
             }
         )
+        if ends:
+            prev_line_end = ends[-1]
     if out[0]["start"] is None:
         out[0]["start"] = seg.get("start")
     if out[-1]["end"] is None:
@@ -182,6 +215,7 @@ def split_segments_into_lines(
     max_chars_cjk: int = LINE_MAX_CHARS_CJK,
     max_words: int = LINE_MAX_WORDS,
     max_seconds: float = LINE_MAX_SECONDS,
+    oov_unit_seconds: float = ALIGN_OOV_UNIT_SECONDS,
 ) -> List[dict]:
     """把對齊後的長段依字級時間(``words``)切成短行(純函式,可單元測試)。
 
@@ -194,7 +228,9 @@ def split_segments_into_lines(
     out: List[dict] = []
     for seg in segments:
         out.extend(
-            _split_segment(seg, separator, max_units, gap_seconds, max_seconds)
+            _split_segment(
+                seg, separator, max_units, gap_seconds, max_seconds, oov_unit_seconds
+            )
         )
     return out
 
@@ -218,13 +254,47 @@ def _load_asr_model():
     return model
 
 
-def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
+def _alignment_segments(segments: List[dict], lang: str) -> List[dict]:
+    """複製一份給 ``whisperx.align`` 的段(純函式):文字做 NFKC / 中文繁 → 簡,
+    逐字等長(中文對齊模型字典只有簡體;Whisper 輸出常繁簡混雜)。
+
+    不遮蔽段落標籤:對齊後的字詞文字會直接顯示,不能留遮蔽字元。
+    """
+    out = []
+    for seg in segments:
+        copy = dict(seg)
+        copy["text"] = normalize_for_alignment(
+            str(seg.get("text") or ""), lang, mask_annotations=False
+        )
+        out.append(copy)
+    return out
+
+
+def finalize_fragments(
+    fragments: List[dict],
+    script: Optional[str],
+    lead_seconds: float = ALIGN_LEAD_SECONDS,
+) -> List[dict]:
+    """顯示前的最後處理(純函式,原地修改並回傳):整行轉成目標字形、起點提前。"""
+    for frag in fragments:
+        frag["text"] = convert_script(frag["text"], script)
+    return apply_lead(fragments, lead_seconds)
+
+
+def transcribe(
+    audio_path: str,
+    language: Optional[str] = None,
+    script: Optional[str] = None,
+) -> dict:
     """轉寫音訊為含時間的歌詞,回傳 LRC 與逐行片段。
 
     參數:
         audio_path: 本機音訊檔路徑(任何 ffmpeg 解得的格式)。
         language: 語言提示(選填)。預設 ``None`` → whisper 自動偵測語言;
             給值時正規化為二字母碼鎖定,避免歌聲誤判。
+        script: 中文輸出字形(``"traditional"`` / ``"simplified"``,選填)。
+            省略時由 ``language`` 推定(``zh-TW`` → 繁體、``zh-CN`` → 簡體),
+            仍無法判定則不轉換。
 
     回傳 ``{"lrc": str, "fragments": [...], "language": str,
     "durationSeconds": float}``(``durationSeconds`` 供呼叫端累加每月配額用量,
@@ -280,7 +350,7 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
     try:
         align_model, metadata = _load_align_model(lang)
         aligned = whisperx.align(
-            raw_segments,
+            _alignment_segments(raw_segments, lang),
             align_model,
             metadata,
             audio,
@@ -303,6 +373,8 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> dict:
     fragments = segments_to_fragments(lines)
     if not fragments:
         raise TranscriptionError("轉寫結果無有效歌詞行")
+    target_script = script or output_script_for(language)
+    finalize_fragments(fragments, target_script)
 
     return {
         "lrc": build_lrc(fragments),

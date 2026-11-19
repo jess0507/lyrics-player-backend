@@ -12,6 +12,7 @@
     python transcribe_local.py song.mp3                    # 自動偵測語言
     python transcribe_local.py song.mp3 -l zh-TW           # 指定語言鎖定
     python transcribe_local.py song.mp3 -o out.lrc         # 同時寫出 .lrc
+    python transcribe_local.py song.mp3 -s traditional     # 中文輸出轉繁體(不鎖語言)
     WHISPER_MODEL_SIZE=medium python transcribe_local.py song.mp3  # 換模型大小
 
 退出碼:0 成功;2 轉寫失敗(辨識不出歌詞);1 其他錯誤。
@@ -37,6 +38,13 @@ def main() -> int:
         "--language",
         default=None,
         help="語言碼(BCP-47 / 二字母 / ISO 639-3);省略則自動偵測",
+    )
+    parser.add_argument(
+        "-s",
+        "--script",
+        choices=["traditional", "simplified"],
+        default=None,
+        help="中文輸出字形;省略則由 -l 推定(zh-TW → 繁、zh-CN → 簡),否則不轉換",
     )
     parser.add_argument(
         "-o",
@@ -69,7 +77,7 @@ def main() -> int:
     )
 
     try:
-        result = transcribe(args.audio, args.language)
+        result = transcribe(args.audio, args.language, script=args.script)
     except TranscriptionError as exc:
         # 轉寫失敗 = 辨識不出可用歌詞(對應後端 422 transcription_failed)。
         print(f"轉寫失敗:{exc}", file=sys.stderr)

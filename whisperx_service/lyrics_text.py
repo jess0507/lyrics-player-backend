@@ -134,14 +134,17 @@ def normalize_for_alignment(
     line: str,
     language: str,
     t2s: Optional[Callable[[str], str]] = None,
+    mask_annotations: bool = True,
 ) -> str:
     """產生對齊用文字:長度與 ``line`` 相同、逐字對應(見模組說明)。
 
     ``t2s`` 為單字元繁 → 簡函式(測試可注入);預設中文用 OpenCC。
+    ``mask_annotations=False`` 時不遮蔽段落標籤 / credits(``/transcribe`` 用:
+    ASR 不會產生這類標記,且對齊結果的文字會直接拿去顯示,不能留遮蔽字元)。
     """
     if language == "zh" and t2s is None:
         t2s = _t2s_char
-    mask = _mask_spans(line)
+    mask = _mask_spans(line) if mask_annotations else [False] * len(line)
     out = []
     for ch, masked in zip(line, mask):
         if masked:
@@ -153,6 +156,56 @@ def normalize_for_alignment(
             c = converted if len(converted) == 1 else c
         out.append(c)
     return "".join(out)
+
+
+# ── 輸出文字的繁簡 ────────────────────────────────────────────────────────
+SCRIPT_TRADITIONAL = "traditional"
+SCRIPT_SIMPLIFIED = "simplified"
+
+# 語言提示(BCP-47,小寫、底線換連字號)→ 輸出字形。
+_TRADITIONAL_HINTS = {"zh-tw", "zh-hk", "zh-mo", "zh-hant", "yue"}
+_SIMPLIFIED_HINTS = {"zh-cn", "zh-sg", "zh-hans"}
+
+
+def output_script_for(language_hint: Optional[str]) -> Optional[str]:
+    """由 client 語言提示決定中文輸出字形;無法判定回 None(不轉換)。
+
+    ``zh-TW`` / ``zh-HK`` / ``zh-Hant-*`` / ``yue`` → 繁體;``zh-CN`` / ``zh-Hans-*``
+    → 簡體;``zh`` 或其他語言 → None。
+    """
+    if not language_hint:
+        return None
+    key = language_hint.strip().lower().replace("_", "-")
+    for hints, script in (
+        (_TRADITIONAL_HINTS, SCRIPT_TRADITIONAL),
+        (_SIMPLIFIED_HINTS, SCRIPT_SIMPLIFIED),
+    ):
+        if key in hints or any(key.startswith(h + "-") for h in hints):
+            return script
+    return None
+
+
+@lru_cache(maxsize=2)
+def _script_converter(config: str) -> Optional[Callable[[str], str]]:
+    try:
+        from opencc import OpenCC
+    except ImportError:
+        log.warning("opencc 未安裝,略過輸出文字繁簡轉換")
+        return None
+    return OpenCC(config).convert
+
+
+def convert_script(text: str, script: Optional[str]) -> str:
+    """把整行文字轉成指定字形(``s2tw`` / ``t2s``);script 為 None 原樣回傳。
+
+    整行轉換而非逐字:簡 → 繁一對多(发 → 發 / 髮、干 → 乾 / 幹),OpenCC
+    需要上下文詞組才能選對。轉換後長度可能改變,只可用在已對完時間的顯示文字。
+    """
+    if not script or not text:
+        return text
+    config = "s2tw" if script == SCRIPT_TRADITIONAL else "t2s"
+    conv = _script_converter(config)
+    return conv(text) if conv is not None else text
 
 
 # ── /align 切長行 ────────────────────────────────────────────────────────

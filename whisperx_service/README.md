@@ -147,6 +147,7 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 | --- | --- | --- |
 | `language` | | 語言**提示**;省略 → whisper **自動偵測**(歌聲場景預設不鎖定)。給值則正規化為二字母碼鎖定。 |
 | `audio` | ✓ | 音訊來源,同 `/align`(`gcs` 或 `inlineBase64`)。物件慣例前綴 `generate/`。 |
+| `script` | | 中文輸出字形 `traditional` / `simplified`;省略則由 `language` 推定。 |
 
 **Response 200**:與 `/align` 同形(`{ "lrc", "fragments", "language" }`);
 `language` 為偵測 / 鎖定的結果。
@@ -169,6 +170,13 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 | `LYRICS_LINE_MAX_SECONDS` | `7` | 一行最長秒數,超過強制換行 |
 
 對齊失敗(退回 ASR 段級時間、無字級時間)時不切行。
+
+**繁簡與時間校正**(與 `/align` 共用 `ALIGN_LEAD_SECONDS` / `ALIGN_OOV_UNIT_SECONDS`):
+- 對齊時餵 NFKC + 繁 → 簡的副本(Whisper 輸出常繁簡混雜,中文對齊模型字典只有簡體)。
+- 輸出時整行用 OpenCC 轉成目標字形:request 的 `script`(`traditional` / `simplified`,
+  選填)優先,省略則由 `language` 推定(`zh-TW` / `zh-HK` / `zh-Hant` → 繁體、
+  `zh-CN` / `zh-Hans` → 簡體),仍無法判定則不轉換。`script` 不會鎖定 ASR 語言。
+- 行首無時間的字依發音單元數往回推起點,每行起點再提前 `ALIGN_LEAD_SECONDS`。
 
 ## 本機驗證
 

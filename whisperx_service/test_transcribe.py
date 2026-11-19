@@ -9,7 +9,9 @@
 import unittest
 
 from transcriber import (
+    _alignment_segments,
     _clean_segment_text,
+    finalize_fragments,
     segments_to_fragments,
     split_segments_into_lines,
 )
@@ -118,8 +120,33 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         lines = _split([{"text": "", "start": 0.5, "end": 2.0, "words": words}], "en")
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0]["text"], "1 2 3")
-        self.assertEqual(lines[0]["start"], 1.0)
+        # 行首 "1" 無時間 → 從 "2"(1.0)往回推 1 單元(預設 0.3s)。
+        self.assertAlmostEqual(lines[0]["start"], 0.7)
         self.assertEqual(lines[0]["end"], 1.5)
+
+    def test_leading_latin_in_cjk_backfills_start(self):
+        # 中文段 "Baby我":英文字母無時間 → 從「我」往回推 1 單元。
+        words = [_w(c) for c in "Baby"] + [_w("我", 5.0, 5.5)]
+        lines = _split(
+            [{"text": "", "start": 5.0, "end": 5.5, "words": words}],
+            "zh",
+            max_chars_cjk=14,
+            oov_unit_seconds=0.3,
+        )
+        self.assertEqual(lines[0]["text"], "Baby我")
+        self.assertAlmostEqual(lines[0]["start"], 4.7)
+
+    def test_backfill_not_before_previous_line_end(self):
+        # 字數上限切出第二行「1你」:往回推不可早於第一行結束(4.95)。
+        words = [_w("我", 0.0, 4.9), _w("好", 4.9, 4.95), _w("1"), _w("你", 5.0, 5.5)]
+        lines = _split(
+            [{"text": "", "start": 0.0, "end": 5.5, "words": words}],
+            "zh",
+            max_chars_cjk=2,
+            oov_unit_seconds=0.3,
+        )
+        self.assertEqual([l["text"] for l in lines], ["我好", "1你"])
+        self.assertEqual(lines[1]["start"], 4.95)
 
     def test_all_untimed_uses_segment_times(self):
         words = [_w("x"), _w("y")]
@@ -141,6 +168,21 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         }
         frags = segments_to_fragments(_split([seg], "en"))
         self.assertEqual([(f["begin"], f["text"]) for f in frags], [(0.0, "a"), (2.0, "b")])
+class AlignmentSegmentsTest(unittest.TestCase):
+    def test_copies_and_keeps_length_without_masking(self):
+        segs = [{"text": "Ｈｉ (x2)", "start": 0.0, "end": 1.0}]
+        out = _alignment_segments(segs, "en")
+        self.assertEqual(out[0]["text"], "Hi (x2)")  # NFKC,不遮蔽
+        self.assertEqual(len(out[0]["text"]), len(segs[0]["text"]))
+        self.assertEqual(segs[0]["text"], "Ｈｉ (x2)")  # 原段不被修改
+
+
+class FinalizeFragmentsTest(unittest.TestCase):
+    def test_lead_applied_without_script(self):
+        frags = [{"index": 0, "begin": 1.0, "end": 2.0, "text": "放弃"}]
+        finalize_fragments(frags, None, lead_seconds=0.2)
+        self.assertAlmostEqual(frags[0]["begin"], 0.8)
+        self.assertEqual(frags[0]["text"], "放弃")  # 不轉換
 
 
 if __name__ == "__main__":
