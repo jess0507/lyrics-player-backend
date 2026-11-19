@@ -11,6 +11,7 @@ import unittest
 from transcriber import (
     _alignment_segments,
     _clean_segment_text,
+    chars_to_words,
     collapse_repetitions,
     drop_hallucinated_segments,
     finalize_fragments,
@@ -219,6 +220,53 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         frags = segments_to_fragments(_split([seg], "en"))
         self.assertEqual([(f["begin"], f["text"]) for f in frags], [(0.0, "a"), (2.0, "b")])
 
+
+
+def _c(ch, start=None, end=None):
+    return {"char": ch, "start": start, "end": end}
+
+
+class CharsToWordsTest(unittest.TestCase):
+    def test_cjk_one_word_per_char_skipping_spaces(self):
+        chars = [_c("你", 0.0, 0.2), _c(" "), _c("好", 0.9, 1.1), _c("3")]
+        words = chars_to_words("你 好3", chars, "")
+        self.assertEqual(
+            words,
+            [
+                {"word": "你", "start": 0.0, "end": 0.2},
+                {"word": "好", "start": 0.9, "end": 1.1},
+                {"word": "3"},  # 字典外:無時間
+            ],
+        )
+
+    def test_spaced_language_groups_by_whitespace(self):
+        text = "hi, you"
+        chars = [
+            _c("h", 0.0, 0.1), _c("i", 0.1, 0.2), _c(","),
+            _c(" "),
+            _c("y", 1.0, 1.1), _c("o", 1.1, 1.2), _c("u", 1.2, 1.3),
+        ]
+        words = chars_to_words(text, chars, " ")
+        self.assertEqual(
+            words,
+            [
+                {"word": "hi,", "start": 0.0, "end": 0.2},
+                {"word": "you", "start": 1.0, "end": 1.3},
+            ],
+        )
+
+    def test_gap_survives_into_line_split(self):
+        # 字間停頓(blank 幀)保留下來 → 切行能在長停頓處斷開。
+        chars = [_c("甲", 0.0, 0.3), _c("乙", 0.3, 0.6), _c("丙", 2.5, 2.8), _c("丁", 2.8, 3.1)]
+        seg = {
+            "text": "甲乙丙丁",
+            "start": 0.0,
+            "end": 3.1,
+            "words": chars_to_words("甲乙丙丁", chars, ""),
+        }
+        lines = split_segments_into_lines([seg], "zh")
+        self.assertEqual([l["text"] for l in lines], ["甲乙", "丙丁"])
+        self.assertEqual(lines[1]["start"], 2.5)
 
 
 class AlignmentSegmentsTest(unittest.TestCase):

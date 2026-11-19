@@ -5,6 +5,10 @@
   - 原因:whisperx 3.1.5 批次解碼不套用 `repetition_penalty`,前奏 / 間奏常解出「啊啊啊…」
   - 同一片語(1~4 單元)連續超過 `ASR_MAX_REPEATS` 次(預設 3,`0` 關閉):語氣詞整串移除,其餘留前 N 次
   - 清完只剩語氣詞 / 標點的段整段丟棄
+- whisperx:`/transcribe` 改用與 `/align` 相同的字級對齊,修正中文歌整段約 30 秒擠成一行
+  - 原因:`whisperx.align` 字間停頓恆為 0,ASR 又無標點,切行找不到斷點
+  - 改為逐段取音訊做 forced alignment,停頓斷點(`LYRICS_LINE_GAP_SECONDS` / `LYRICS_LINE_LONG_GAP_SECONDS`)恢復作用
+  - 單段對齊失敗只該段退回 ASR 段級時間
 
 ## 1.0.0(20261119)
 - 首個標記版本

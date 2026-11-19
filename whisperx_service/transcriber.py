@@ -10,11 +10,15 @@ WhisperX 標準管線本就是「transcribe → align」兩段,align 後半已�
 
 1. `whisperx.load_audio` 解 16kHz mono;`load_model(...).transcribe(...)` 取
    逐段(segment)文字與時間,**語言預設自動偵測**(歌聲場景不強制鎖定)。
-2. 以偵測語言載入對齊模型,`whisperx.align(...)` 精修每段時間(失敗則退回
-   ASR 段級時間,不致整批失敗)。
+2. 以偵測語言載入對齊模型,**逐段**取該段音訊、以 `aligner._char_alignments`
+   (與 ``/align`` 同一套 `forced_align` + `frame_spans`)精修逐字時間。不用
+   `whisperx.align`:它把字間的 CTC blank 幀併進前一字,字與字首尾相接、停頓恆為 0,
+   中文 ASR 又無標點 → 切行找不到任何斷點(整段 30 秒一行)。單段對齊失敗只該段
+   退回 ASR 段級時間,不致整批失敗。
 3. 依字級時間把長段切成短行(與 ``/align`` 共用規則:句末標點 / 長停頓必斷,
    過長才在子句標點 / 停頓斷,見 :func:`split_segments_into_lines`)→ 組 LRC。行首無時間的字(字典外)依發音單元數往回推起點。
-4. 對齊時餵 NFKC / 繁 → 簡的副本(中文對齊模型字典只有簡體);輸出時整行轉成
+4. 對齊時餵 NFKC / 繁 → 簡的副本(中文對齊模型字典只有簡體;逐字等長,時間
+   直接對回 Whisper 原文);輸出時整行轉成
    client 要的字形(``script``,或由 ``zh-TW`` / ``zh-CN`` 推定),再把每行起點
    提前 ``ALIGN_LEAD_SECONDS``(與 ``/align`` 共用)。
 
@@ -33,6 +37,7 @@ from typing import Dict, List, Optional
 from aligner import (
     ALIGN_LEAD_SECONDS,
     ALIGN_OOV_UNIT_SECONDS,
+    _char_alignments,
     _leading_untimed_units,
     _load_align_model,
     apply_lead,
@@ -358,8 +363,93 @@ def _load_asr_model():
     return model
 
 
+def chars_to_words(text: str, chars: List[dict], separator: str) -> List[dict]:
+    """把逐字對齊結果併成 whisperx 同形的 ``words``(純函式,可單元測試)。
+
+    ``chars`` 與 ``text`` 逐字對應(``_char_alignments`` 的輸出,字典外的字
+    start / end 為 None)。中 / 日文(``separator == ""``)每個非空白字一個 word;
+    其餘語言以空白分詞,詞的 ``start`` 取第一個有時間的字、``end`` 取最後一個。
+    整詞無時間則不帶 start / end(交給 :func:`_split_segment` 處理字典外字)。
+    """
+    words: List[dict] = []
+
+    def emit(word_chars: List[dict]) -> None:
+        word = {"word": "".join(c["char"] for c in word_chars)}
+        starts = [c["start"] for c in word_chars if c.get("start") is not None]
+        ends = [c["end"] for c in word_chars if c.get("end") is not None]
+        if starts:
+            word["start"] = starts[0]
+        if ends:
+            word["end"] = ends[-1]
+        words.append(word)
+
+    if separator == "":
+        for c in chars:
+            if not c["char"].isspace():
+                emit([c])
+        return words
+
+    cur: List[dict] = []
+    for c in chars:
+        if c["char"].isspace():
+            if cur:
+                emit(cur)
+                cur = []
+        else:
+            cur.append(c)
+    if cur:
+        emit(cur)
+    return words
+
+
+def _align_segments(segments: List[dict], lang: str, audio) -> List[dict]:
+    """逐段做字級 forced alignment,回傳帶 ``words`` 的段(時間為整首絕對秒數)。
+
+    每段只取 ``[start, end]`` 的音訊,文字為壓平空白後的 Whisper 原文;對齊餵
+    :func:`_alignment_segments` 的正規化副本(逐字等長),時間對回原文字元。
+    單段對齊失敗(字典外字過多、文字比音訊長等)則該段不帶 ``words``,
+    由 :func:`split_segments_into_lines` 原樣保留為 ASR 段級時間。
+    對齊模型載入失敗則直接丟出(由呼叫端整批退回 ASR 段級時間)。
+    """
+    model, metadata = _load_align_model(lang)
+    separator = separator_for(lang)
+    cleaned = [
+        {**seg, "text": _clean_segment_text(seg.get("text"))} for seg in segments
+    ]
+    normalized = _alignment_segments(cleaned, lang)
+    out: List[dict] = []
+    for seg, norm in zip(cleaned, normalized):
+        text = seg["text"]
+        start, end = seg.get("start"), seg.get("end")
+        if not text or start is None or end is None:
+            out.append(seg)
+            continue
+        s = max(int(float(start) * _SAMPLE_RATE), 0)
+        e = min(int(float(end) * _SAMPLE_RATE), len(audio))
+        if e <= s:
+            out.append(seg)
+            continue
+        try:
+            chars = _char_alignments(model, metadata, audio[s:e], norm["text"])
+        except Exception as exc:  # AlignmentError / torch 內部錯誤 → 該段退回
+            log.warning("段 %.1f~%.1fs 對齊失敗,退回段級時間:%s", start, end, exc)
+            out.append(seg)
+            continue
+        offset = s / _SAMPLE_RATE
+        timed = [
+            {
+                "char": orig,
+                "start": c["start"] + offset if c["start"] is not None else None,
+                "end": c["end"] + offset if c["end"] is not None else None,
+            }
+            for orig, c in zip(text, chars)
+        ]
+        out.append({**seg, "words": chars_to_words(text, timed, separator)})
+    return out
+
+
 def _alignment_segments(segments: List[dict], lang: str) -> List[dict]:
-    """複製一份給 ``whisperx.align`` 的段(純函式):文字做 NFKC / 中文繁 → 簡,
+    """複製一份給字級對齊的段(純函式):文字做 NFKC / 中文繁 → 簡,
     逐字等長(中文對齊模型字典只有簡體;Whisper 輸出常繁簡混雜)。
 
     不遮蔽段落標籤:對齊後的字詞文字會直接顯示,不能留遮蔽字元。
@@ -452,21 +542,12 @@ def transcribe(
     if not any(_clean_segment_text(s.get("text")) for s in raw_segments):
         raise TranscriptionError("未辨識出任何歌詞文字")
 
-    # 字級對齊精修每段時間;複用對齊路線的 _load_align_model(不快取模型,
-    # 每次重新載入)。對齊失敗不致整批失敗——退回 ASR 段級時間(粒度較粗但仍可用)。
+    # 逐段字級對齊精修時間;與 /align 共用 _load_align_model / _char_alignments
+    # (不快取模型,每次重新載入)。模型不可用則整批退回 ASR 段級時間(粒度較粗但仍可用)。
     segments = raw_segments
     t_align = time.perf_counter()
     try:
-        align_model, metadata = _load_align_model(lang)
-        aligned = whisperx.align(
-            _alignment_segments(raw_segments, lang),
-            align_model,
-            metadata,
-            audio,
-            "cpu",
-            return_char_alignments=False,
-        )
-        segments = aligned.get("segments") or raw_segments
+        segments = _align_segments(raw_segments, lang, audio)
         log.info("字級對齊完成(耗時 %.1fs)", time.perf_counter() - t_align)
     except Exception as exc:  # 無對齊模型 / 對齊失敗 → 退回 ASR 段級時間。
         log.warning(
