@@ -1,6 +1,10 @@
 # Changelog
 
 ## develop
+- whisperx:`/transcribe` 過濾 ASR 重複幻聽
+  - 原因:whisperx 3.1.5 批次解碼不套用 `repetition_penalty`,前奏 / 間奏常解出「啊啊啊…」
+  - 同一片語(1~4 單元)連續超過 `ASR_MAX_REPEATS` 次(預設 3,`0` 關閉):語氣詞整串移除,其餘留前 N 次
+  - 清完只剩語氣詞 / 標點的段整段丟棄
 
 ## 1.0.0(20261119)
 - 首個標記版本

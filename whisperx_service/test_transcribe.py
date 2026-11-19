@@ -11,6 +11,8 @@ import unittest
 from transcriber import (
     _alignment_segments,
     _clean_segment_text,
+    collapse_repetitions,
+    drop_hallucinated_segments,
     finalize_fragments,
     segments_to_fragments,
     split_segments_into_lines,
@@ -234,6 +236,54 @@ class FinalizeFragmentsTest(unittest.TestCase):
         finalize_fragments(frags, None, lead_seconds=0.2)
         self.assertAlmostEqual(frags[0]["begin"], 0.8)
         self.assertEqual(frags[0]["text"], "放弃")  # 不轉換
+
+
+class CollapseRepetitionsTest(unittest.TestCase):
+    def test_filler_run_removed_entirely(self):
+        self.assertEqual(collapse_repetitions("啊" * 90), "")
+
+    def test_leading_filler_run_removed_from_lyric(self):
+        self.assertEqual(
+            collapse_repetitions("啊" * 30 + "為何臨水前會想要留一盞燈"),
+            "為何臨水前會想要留一盞燈",
+        )
+
+    def test_short_repeat_kept(self):
+        self.assertEqual(collapse_repetitions("斑斑斑"), "斑斑斑")
+        self.assertEqual(collapse_repetitions("啊啊"), "啊啊")
+
+    def test_non_filler_phrase_trimmed_to_max(self):
+        self.assertEqual(collapse_repetitions("我愛你" * 6, max_repeats=3), "我愛你" * 3)
+
+    def test_mid_line_cut_adds_no_space_in_cjk(self):
+        self.assertEqual(collapse_repetitions("前面" + "啊" * 10 + "後面"), "前面後面")
+
+    def test_latin_filler_words_removed(self):
+        self.assertEqual(collapse_repetitions("la la la la la la hello"), "hello")
+
+    def test_filler_with_punctuation_pattern(self):
+        self.assertEqual(collapse_repetitions("啊，" * 8 + "我愛你"), "我愛你")
+
+    def test_disabled_when_max_repeats_zero(self):
+        self.assertEqual(collapse_repetitions("啊" * 10, max_repeats=0), "啊" * 10)
+
+
+class DropHallucinatedSegmentsTest(unittest.TestCase):
+    def test_drops_filler_only_and_cleans_mixed(self):
+        segs = [
+            _seg("啊" * 64, 5.0, 11.0),
+            _seg("啊啊", 20.0, 20.7),
+            _seg("啊" * 40 + "為何臨水前", 23.0, 37.0),
+            _seg("要為自己保留幾分", 77.0, 80.0),
+        ]
+        out = drop_hallucinated_segments(segs)
+        self.assertEqual([s["text"] for s in out], ["為何臨水前", "要為自己保留幾分"])
+        self.assertEqual((out[0]["start"], out[0]["end"]), (23.0, 37.0))
+        self.assertEqual(segs[2]["text"], "啊" * 40 + "為何臨水前")  # 不改輸入
+
+    def test_drops_empty_and_punct_only(self):
+        segs = [_seg("", 0.0, 1.0), _seg("……", 1.0, 2.0), _seg("hello", 2.0, 3.0)]
+        self.assertEqual([s["text"] for s in drop_hallucinated_segments(segs)], ["hello"])
 
 
 if __name__ == "__main__":

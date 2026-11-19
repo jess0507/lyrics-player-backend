@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -77,6 +78,115 @@ class TranscriptionError(Exception):
 def _clean_segment_text(text: object) -> str:
     """壓平段內換行 / 連續空白為單一空格並去前後空白(避免 LRC 一行含換行)。"""
     return " ".join(str(text or "").split()).strip()
+
+
+# ── 重複幻聽過濾 ────────────────────────────────────────────────────────
+# whisperx 3.1.5 的批次解碼(generate_segment_batched)只把 beam_size 等少數參數傳給
+# 模型,repetition_penalty / no_repeat_ngram_size / compression_ratio_threshold /
+# 溫度 fallback 都不生效 → 前奏、間奏等純音樂段常解出「啊啊啊…」整串。只能在 ASR
+# 之後、對齊之前把這類段清掉(也避免把垃圾字硬對進音訊)。
+
+# 同一個片語(1~_REPEAT_MAX_UNITS 個單元)連續出現超過此次數即視為重複幻聽。
+ASR_MAX_REPEATS = int(os.environ.get("ASR_MAX_REPEATS", "3"))
+# 偵測的片語最長單元數(中文一字一單元;英數一個詞一單元;標點也算一單元)。
+_REPEAT_MAX_UNITS = 4
+
+# 單元:英數詞整個算一個,其餘非空白字元一字一個(與 lyrics_text 切行同一套)。
+_UNIT_RE = re.compile(r"[A-Za-z0-9'’]+|\S")
+_WORD_CHAR_RE = re.compile(r"\w")
+
+# 語氣詞 / 襯字:整串由這些組成的重複片語整段移除;整行只剩這些的段直接丟掉。
+_FILLER_CJK = set("啊阿呀哦喔噢嗯哼哈啦呐哇唔欸诶誒耶嘿哎嗚呜喲哟")
+_FILLER_LATIN = {
+    "ah", "aah", "oh", "ooh", "o", "la", "na", "da", "uh", "um", "mm", "mmm",
+    "hmm", "hm", "yeah", "ya", "hey", "whoa", "woah", "wo", "wu", "ha",
+}
+
+
+def _is_punct_unit(unit: str) -> bool:
+    return not _WORD_CHAR_RE.search(unit)
+
+
+def _is_filler_unit(unit: str) -> bool:
+    return unit in _FILLER_CJK or unit.lower() in _FILLER_LATIN
+
+
+def _is_filler_only(units: List[str]) -> bool:
+    """非標點的單元全是語氣詞(且至少一個)。"""
+    words = [u for u in units if not _is_punct_unit(u)]
+    return bool(words) and all(_is_filler_unit(u) for u in words)
+
+
+def collapse_repetitions(text: str, max_repeats: int = ASR_MAX_REPEATS) -> str:
+    """清掉文字中的重複幻聽(純函式,可單元測試)。
+
+    同一片語(1~4 個單元)連續出現超過 ``max_repeats`` 次時:
+    - 片語全是語氣詞(「啊」「la la」…)→ 整串移除;
+    - 否則保留前 ``max_repeats`` 次、移除其餘。
+
+    ``max_repeats <= 0`` 時不處理。
+    """
+    if max_repeats <= 0:
+        return text
+    matches = list(_UNIT_RE.finditer(text))
+    keys = [m.group().lower() for m in matches]
+    n = len(keys)
+    cuts: List[tuple] = []  # 要移除的原文字元區間 [start, end)
+    i = 0
+    while i < n:
+        advanced = False
+        for size in range(1, _REPEAT_MAX_UNITS + 1):
+            if i + size * (max_repeats + 1) > n:
+                break
+            pattern = keys[i : i + size]
+            reps = 1
+            while keys[i + reps * size : i + (reps + 1) * size] == pattern:
+                reps += 1
+            if reps <= max_repeats:
+                continue
+            run_end = i + reps * size  # 不含
+            keep = 0 if _is_filler_only(pattern) else max_repeats
+            cut_from = i + keep * size
+            cuts.append((matches[cut_from].start(), matches[run_end - 1].end()))
+            i = run_end
+            advanced = True
+            break
+        if not advanced:
+            i += 1
+    if not cuts:
+        return text
+    pieces: List[str] = []
+    pos = 0
+    for start, end in cuts:
+        pieces.append(text[pos:start])
+        pos = end
+    pieces.append(text[pos:])
+    # 直接接回(中文句中截斷不可補空格),再壓平英文截斷處留下的連續空白。
+    return _clean_segment_text("".join(pieces))
+
+
+def drop_hallucinated_segments(
+    segments: List[dict], max_repeats: int = ASR_MAX_REPEATS
+) -> List[dict]:
+    """過濾 ASR 段的重複幻聽(純函式,不改輸入)。
+
+    每段文字先經 :func:`collapse_repetitions`;清完後沒有字、或只剩語氣詞 / 標點的
+    段整段丟掉(前奏被解成「啊啊」也一併去除)。其餘欄位(start / end)原樣保留。
+    """
+    out: List[dict] = []
+    for seg in segments:
+        text = _clean_segment_text(seg.get("text"))
+        cleaned = collapse_repetitions(text, max_repeats)
+        units = _UNIT_RE.findall(cleaned)
+        if not units or all(_is_punct_unit(u) for u in units) or _is_filler_only(units):
+            if text:
+                log.info("丟棄重複 / 語氣詞段 [%s-%s]:%.40s", seg.get("start"), seg.get("end"), text)
+            continue
+        if cleaned != text:
+            log.info("清除段內重複:%.40s → %.40s", text, cleaned)
+            seg = {**seg, "text": cleaned}
+        out.append(seg)
+    return out
 
 
 def segments_to_fragments(segments: List[dict]) -> List[dict]:
@@ -334,6 +444,11 @@ def transcribe(
 
     raw_segments = result.get("segments") or []
     lang = result.get("language") or lang_hint or "en"
+    # 先清重複幻聽(前奏 / 間奏的「啊啊啊…」)再對齊,垃圾字不進對齊、也不出現在歌詞。
+    n_raw = len(raw_segments)
+    raw_segments = drop_hallucinated_segments(raw_segments)
+    if len(raw_segments) != n_raw:
+        log.info("重複幻聽過濾 段數=%d → %d", n_raw, len(raw_segments))
     if not any(_clean_segment_text(s.get("text")) for s in raw_segments):
         raise TranscriptionError("未辨識出任何歌詞文字")
 
