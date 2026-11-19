@@ -85,34 +85,81 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         seg = _seg("hello world", 0.0, 2.0)
         self.assertEqual(_split([seg], "en"), [seg])
 
-    def test_splits_on_pause(self):
+    def test_long_pause_splits_even_short_line(self):
+        # 停頓 2.0s ≥ 長停頓門檻(1.5s):行不長也斷。
         seg = {
             "text": "a b c",
             "start": 0.0,
-            "end": 3.0,
-            "words": [_w("a", 0.0, 0.5), _w("b", 0.6, 1.0), _w("c", 2.0, 3.0)],
+            "end": 4.0,
+            "words": [_w("a", 0.0, 0.5), _w("b", 0.6, 1.0), _w("c", 3.0, 4.0)],
         }
         lines = _split([seg], "en")
         self.assertEqual([l["text"] for l in lines], ["a b", "c"])
-        self.assertEqual(lines[1]["start"], 2.0)  # 新行時間取首字 start
+        self.assertEqual(lines[1]["start"], 3.0)  # 新行時間取首字 start
         self.assertEqual(lines[0]["end"], 1.0)
 
-    def test_splits_on_max_words(self):
-        words = [_w(t, i * 0.3, i * 0.3 + 0.2) for i, t in enumerate("abcde")]
+    def test_short_pause_in_short_line_not_split(self):
+        words = [_w("a", 0.0, 0.5), _w("b", 1.5, 2.0)]  # 停頓 1.0s
         lines = _split([{"text": "", "start": 0.0, "end": 2.0, "words": words}], "en")
-        self.assertEqual([l["text"] for l in lines], ["a b c", "d e"])
+        self.assertEqual([l["text"] for l in lines], ["a b"])
+
+    def test_sentence_end_splits(self):
+        words = [_w("Hi.", 0.0, 0.3), _w("Me", 0.4, 0.6), _w("too.", 0.7, 0.9)]
+        lines = _split([{"text": "", "start": 0.0, "end": 1.0, "words": words}], "en")
+        self.assertEqual([l["text"] for l in lines], ["Hi.", "Me too."])
+
+    def test_long_sentence_without_punct_or_pause_not_cut_mid_sentence(self):
+        # 回報案例:10 詞上限不再硬切成 "...live in" / "the States."。
+        text = "car insurance is an absolute necessity if you live in the States."
+        words = [_w(t, i * 0.3, i * 0.3 + 0.25) for i, t in enumerate(text.split())]
+        lines = _split(
+            [{"text": text, "start": 0.0, "end": 4.0, "words": words}],
+            "en",
+            max_words=10,
+        )
+        self.assertEqual([l["text"] for l in lines], [text])
+
+    def test_long_line_split_at_clause_punct(self):
+        words = [_w("a,", 0.0, 0.2), _w("b", 0.3, 0.5), _w("c", 0.6, 0.8), _w("d", 0.9, 1.0)]
+        lines = _split([{"text": "", "start": 0.0, "end": 1.0, "words": words}], "en")
+        self.assertEqual([l["text"] for l in lines], ["a,", "b c d"])
+
+    def test_long_line_split_at_pause(self):
+        # 4 詞 > 上限 3,停頓 0.8s(≥ 0.6、< 1.5)可作為斷點。
+        words = [_w("a", 0.0, 0.2), _w("b", 0.3, 0.5), _w("c", 1.3, 1.5), _w("d", 1.6, 1.8)]
+        lines = _split([{"text": "", "start": 0.0, "end": 2.0, "words": words}], "en")
+        self.assertEqual([l["text"] for l in lines], ["a b", "c d"])
 
     def test_cjk_joined_without_space_and_counted_by_chars(self):
         words = [_w(ch, i * 0.2, i * 0.2 + 0.1) for i, ch in enumerate("我愛你中國人")]
+        words.insert(3, _w("，"))
         lines = _split([{"text": "", "start": 0.0, "end": 2.0, "words": words}], "zh")
-        self.assertEqual([l["text"] for l in lines], ["我愛你中", "國人"])
+        self.assertEqual([l["text"] for l in lines], ["我愛你，", "中國人"])
 
-    def test_splits_on_max_duration(self):
-        words = [_w("a", 0.0, 2.0), _w("b", 2.1, 4.0), _w("c", 4.1, 6.0)]
+    def test_script_switch_at_edge_splits(self):
+        words = [_w(c, 0.1 * i, 0.1 * i + 0.05) for i, c in enumerate("Apple蘋果")]
+        lines = _split(
+            [{"text": "", "start": 0.0, "end": 1.0, "words": words}], "zh", max_chars_cjk=14
+        )
+        self.assertEqual([l["text"] for l in lines], ["Apple", "蘋果"])
+
+    def test_word_split_at_script_switch_interpolates_time(self):
+        # 單一詞 "Absorb,吸收."(1.0~2.0s,10 字)在語系切換處斷:後半行起點依字數內插。
+        words = [_w("Absorb,吸收.", 1.0, 2.0)]
+        lines = _split(
+            [{"text": "", "start": 1.0, "end": 2.0, "words": words}], "en", max_words=10
+        )
+        self.assertEqual([l["text"] for l in lines], ["Absorb,", "吸收."])
+        self.assertAlmostEqual(lines[0]["start"], 1.0)
+        self.assertAlmostEqual(lines[1]["start"], 1.7)
+        self.assertAlmostEqual(lines[1]["end"], 2.0)
+
+    def test_splits_on_max_duration_at_clause_punct(self):
+        words = [_w("a,", 0.0, 2.0), _w("b,", 2.1, 4.0), _w("c", 4.1, 6.0)]
         lines = _split(
             [{"text": "", "start": 0.0, "end": 6.0, "words": words}], "en", max_words=10
         )
-        self.assertEqual([l["text"] for l in lines], ["a b", "c"])
+        self.assertEqual([l["text"] for l in lines], ["a, b,", "c"])
 
     def test_untimed_words_do_not_break_and_fallback_to_segment_times(self):
         # 數字等字典外字元無時間:不觸發停頓斷行,首 / 末行時間退回原段。
@@ -124,28 +171,29 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         self.assertAlmostEqual(lines[0]["start"], 0.7)
         self.assertEqual(lines[0]["end"], 1.5)
 
-    def test_leading_latin_in_cjk_backfills_start(self):
-        # 中文段 "Baby我":英文字母無時間 → 從「我」往回推 1 單元。
-        words = [_w(c) for c in "Baby"] + [_w("我", 5.0, 5.5)]
+    def test_leading_digits_in_cjk_backfill_start(self):
+        # 中文段 "520我":數字無時間(也不觸發語系切換)→ 從「我」往回推 3 單元。
+        words = [_w(c) for c in "520"] + [_w("我", 5.0, 5.5)]
         lines = _split(
             [{"text": "", "start": 5.0, "end": 5.5, "words": words}],
             "zh",
             max_chars_cjk=14,
             oov_unit_seconds=0.3,
         )
-        self.assertEqual(lines[0]["text"], "Baby我")
-        self.assertAlmostEqual(lines[0]["start"], 4.7)
+        self.assertEqual(lines[0]["text"], "520我")
+        self.assertAlmostEqual(lines[0]["start"], 4.1)
 
     def test_backfill_not_before_previous_line_end(self):
-        # 字數上限切出第二行「1你」:往回推不可早於第一行結束(4.95)。
-        words = [_w("我", 0.0, 4.9), _w("好", 4.9, 4.95), _w("1"), _w("你", 5.0, 5.5)]
+        # 句號切出第二行「1你」:往回推不可早於第一行結束(4.95)。
+        words = [
+            _w("我", 0.0, 4.9), _w("好", 4.9, 4.95), _w("。"), _w("1"), _w("你", 5.0, 5.5),
+        ]
         lines = _split(
             [{"text": "", "start": 0.0, "end": 5.5, "words": words}],
             "zh",
-            max_chars_cjk=2,
             oov_unit_seconds=0.3,
         )
-        self.assertEqual([l["text"] for l in lines], ["我好", "1你"])
+        self.assertEqual([l["text"] for l in lines], ["我好。", "1你"])
         self.assertEqual(lines[1]["start"], 4.95)
 
     def test_all_untimed_uses_segment_times(self):
@@ -168,6 +216,9 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         }
         frags = segments_to_fragments(_split([seg], "en"))
         self.assertEqual([(f["begin"], f["text"]) for f in frags], [(0.0, "a"), (2.0, "b")])
+
+
+
 class AlignmentSegmentsTest(unittest.TestCase):
     def test_copies_and_keeps_length_without_masking(self):
         segs = [{"text": "Ｈｉ (x2)", "start": 0.0, "end": 1.0}]

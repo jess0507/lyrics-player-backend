@@ -12,8 +12,8 @@ WhisperX 標準管線本就是「transcribe → align」兩段,align 後半已�
    逐段(segment)文字與時間,**語言預設自動偵測**(歌聲場景不強制鎖定)。
 2. 以偵測語言載入對齊模型,`whisperx.align(...)` 精修每段時間(失敗則退回
    ASR 段級時間,不致整批失敗)。
-3. 依字級時間把長段切成短行(停頓 / 字數 / 時長門檻,見 :func:`split_segments_into_lines`)
-   → 組 LRC。行首無時間的字(字典外)依發音單元數往回推起點。
+3. 依字級時間把長段切成短行(與 ``/align`` 共用規則:句末標點 / 長停頓必斷,
+   過長才在子句標點 / 停頓斷,見 :func:`split_segments_into_lines`)→ 組 LRC。行首無時間的字(字典外)依發音單元數往回推起點。
 4. 對齊時餵 NFKC / 繁 → 簡的副本(中文對齊模型字典只有簡體);輸出時整行轉成
    client 要的字形(``script``,或由 ``zh-TW`` / ``zh-CN`` 推定),再把每行起點
    提前 ``ALIGN_LEAD_SECONDS``(與 ``/align`` 共用)。
@@ -41,12 +41,14 @@ from aligner import (
 from lrc import build_lrc
 from lyrics_text import (
     LINE_GAP_SECONDS,
+    LINE_LONG_GAP_SECONDS,
     LINE_MAX_CHARS_CJK,
     LINE_MAX_SECONDS,
     LINE_MAX_WORDS,
     convert_script,
     normalize_for_alignment,
     output_script_for,
+    split_aligned_lines,
 )
 
 log = logging.getLogger(__name__)
@@ -118,87 +120,75 @@ def _word_time(word: dict, key: str) -> Optional[float]:
 def _split_segment(
     seg: dict,
     separator: str,
-    max_units: int,
-    gap_seconds: float,
-    max_seconds: float,
+    split_params: dict,
     oov_unit_seconds: float = ALIGN_OOV_UNIT_SECONDS,
 ) -> List[dict]:
     """依字級時間把單一 segment 切成多個子段(``{text, start, end}``)。
 
-    換行條件(目前行非空時,在下一個字之前斷開):
-    - 與前一個有時間的字間隔 ≥ ``gap_seconds``(換氣停頓);
-    - 目前行字(詞)數已達 ``max_units``;
-    - 加入此字後行長(首字 start → 此字 end)> ``max_seconds``。
+    把 ``words`` 串成一行文字 + 逐字時間(詞的時間在詞內逐字線性內插;只有
+    start 或 end 時給首字 / 末字),
+    交給與 ``/align`` 共用的 :func:`lyrics_text.split_aligned_lines` 切行
+    (句末標點 / 長停頓必斷;過長才在子句標點 / 停頓斷;行首尾外文斷開)。
 
     無 ``words`` 時原樣回傳。子段缺時間時,首段沿用原段 ``start``、末段沿用原段
     ``end``,其餘交給 :func:`segments_to_fragments` 沿用前一行時間。
 
     子段開頭有無時間的字(字典外:中文裡的英文 / 數字等)時,起點依其發音單元數
     × ``oov_unit_seconds`` 從第一個有時間的字往回推,不早於前一子段結束;
-    跨行的下限由 :func:`segments_to_fragments` 夾住。
+    跨段的下限由 :func:`segments_to_fragments` 夾住。
     """
-    words = seg.get("words") or []
+    words = [
+        (text, _word_time(w, "start"), _word_time(w, "end"))
+        for w in (seg.get("words") or [])
+        for text in [str(w.get("word") or "").strip()]
+        if text
+    ]
     if not words:
         return [seg]
 
-    lines: List[List[dict]] = []
-    current: List[dict] = []
-    line_start: Optional[float] = None
-    prev_end: Optional[float] = None
-    for word in words:
-        text = str(word.get("word") or "").strip()
-        if not text:
+    line = separator.join(t for t, _s, _e in words)
+    chars: List[dict] = []
+    for i, (text, w_start, w_end) in enumerate(words):
+        if i > 0:
+            chars.extend({"char": c, "start": None, "end": None} for c in separator)
+        n = len(text)
+        if w_start is not None and w_end is not None and w_end > w_start:
+            # 詞內逐字線性內插:一個詞被切成兩行時(如 "Absorb,吸收." 在語系
+            # 切換處斷開),後半行才有自己的估計起點,而不是跟前半行同一時間。
+            step = (w_end - w_start) / n
+            chars.extend(
+                {"char": ch, "start": w_start + step * k, "end": w_start + step * (k + 1)}
+                for k, ch in enumerate(text)
+            )
             continue
-        w_start = _word_time(word, "start")
-        w_end = _word_time(word, "end")
-        if current:
-            gap_break = (
-                w_start is not None
-                and prev_end is not None
-                and w_start - prev_end >= gap_seconds
+        for k, ch in enumerate(text):
+            chars.append(
+                {
+                    "char": ch,
+                    "start": w_start if k == 0 else None,
+                    "end": w_end if k == n - 1 else None,
+                }
             )
-            length_break = len(current) >= max_units
-            duration_break = (
-                line_start is not None
-                and w_end is not None
-                and w_end - line_start > max_seconds
-            )
-            if gap_break or length_break or duration_break:
-                lines.append(current)
-                current, line_start = [], None
-        current.append({"text": text, "start": w_start, "end": w_end})
-        if line_start is None and w_start is not None:
-            line_start = w_start
-        if w_end is not None:
-            prev_end = w_end
-    if current:
-        lines.append(current)
-    if not lines:
-        return [seg]
+
+    new_lines, new_chars = split_aligned_lines([line], chars, separator, **split_params)
 
     out: List[dict] = []
     prev_line_end: Optional[float] = None
-    for line in lines:
-        starts = [w["start"] for w in line if w["start"] is not None]
-        ends = [w["end"] for w in line if w["end"] is not None]
-        start = starts[0] if starts else None
-        if start is not None and oov_unit_seconds > 0:
-            lead_words = []
-            for w in line:
-                if w["start"] is not None:
-                    break
-                lead_words.append(w["text"])
-            units = _leading_untimed_units(separator.join(lead_words))
+    pos = 0
+    for li, text in enumerate(new_lines):
+        if li > 0:
+            pos += len(separator)
+        line_chars = new_chars[pos : pos + len(text)]
+        pos += len(text)
+        first = next((k for k, c in enumerate(line_chars) if c["start"] is not None), None)
+        ends = [c["end"] for c in line_chars if c["end"] is not None]
+        start = line_chars[first]["start"] if first is not None else None
+        if first and oov_unit_seconds > 0:
+            units = _leading_untimed_units("".join(c["char"] for c in line_chars[:first]))
             if units:
                 floor = prev_line_end if prev_line_end is not None else 0.0
                 start = max(start - units * oov_unit_seconds, floor, 0.0)
-        out.append(
-            {
-                "text": separator.join(w["text"] for w in line),
-                "start": start,
-                "end": ends[-1] if ends else None,
-            }
-        )
+        out.append({"text": text, "start": start, "end": ends[-1] if ends else None})
         if ends:
             prev_line_end = ends[-1]
     if out[0]["start"] is None:
@@ -215,23 +205,27 @@ def split_segments_into_lines(
     max_chars_cjk: int = LINE_MAX_CHARS_CJK,
     max_words: int = LINE_MAX_WORDS,
     max_seconds: float = LINE_MAX_SECONDS,
+    long_gap_seconds: float = LINE_LONG_GAP_SECONDS,
     oov_unit_seconds: float = ALIGN_OOV_UNIT_SECONDS,
 ) -> List[dict]:
-    """把對齊後的長段依字級時間(``words``)切成短行(純函式,可單元測試)。
+    """把對齊後的段依字級時間(``words``)切成短行(純函式,可單元測試)。
 
-    中 / 日文的 ``words`` 為逐字、以空字串串接並以字數計上限;其餘語言為逐詞、
-    以空格串接並以詞數計上限。無 ``words`` 的段(如對齊失敗退回 ASR 段級時間)
-    原樣保留。
+    切行規則與 ``/align`` 相同(見 :func:`lyrics_text.split_aligned_lines`);
+    每個 ASR 段本身就是邊界。中 / 日文的 ``words`` 為逐字、以空字串串接並以字數
+    計上限;其餘語言為逐詞、以空格串接並以詞數計上限。無 ``words`` 的段(如對齊
+    失敗退回 ASR 段級時間)原樣保留。
     """
     separator = separator_for(language)
-    max_units = max_chars_cjk if separator == "" else max_words
+    split_params = dict(
+        max_chars_cjk=max_chars_cjk,
+        max_words=max_words,
+        max_seconds=max_seconds,
+        gap_seconds=gap_seconds,
+        long_gap_seconds=long_gap_seconds,
+    )
     out: List[dict] = []
     for seg in segments:
-        out.extend(
-            _split_segment(
-                seg, separator, max_units, gap_seconds, max_seconds, oov_unit_seconds
-            )
-        )
+        out.extend(_split_segment(seg, separator, split_params, oov_unit_seconds))
     return out
 
 

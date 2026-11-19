@@ -111,10 +111,9 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
   `Lyrics by:` 等 credits、`[ar:…]` metadata、殘留 LRC 時間戳、`(x2)` / `×3`。
   這些行保留在輸出中,時間沿用前一行。
 
-**切長行**(`ALIGN_SPLIT_LINES`,預設 `1`;設 `0` 關閉):行的單元數(中日文字數 /
-其他語言詞數)或時長超過上限時,依標點 → 換氣停頓 → 長度上限切短;短行即使含
-標點也不切。門檻與 `/transcribe` 共用(見下方「切行」表)。啟用時 `lrc` /
-`fragments` 的行數可能多於輸入 `lines`。
+**切行**(`ALIGN_SPLIT_LINES`,預設 `1`;設 `0` 關閉):規則與 `/transcribe` 相同,
+見下方「切行」。使用者原本的分行一律保留,只會再切短;啟用時 `lrc` / `fragments`
+的行數可能多於輸入 `lines`。
 
 **時間校正**(只調整每行起點 `begin`):
 - 行首補時(`ALIGN_OOV_UNIT_SECONDS`,預設 `0.3`;設 `0` 關閉):行首的字不在
@@ -159,15 +158,27 @@ App 端通常只需 `lrc`,直接寫入 `LyricsEntity.content`(`format = lrc`、
 模型大小由 `WHISPER_MODEL_SIZE`(預設 `small`)、量化 `WHISPER_COMPUTE_TYPE`
 (預設 `int8`)控制;CPU 上 large 對長曲易逼近逾時,實測後再調。
 
-**切行**:whisperx 會把語音合併成最長約 30 秒的段,歌聲又少標點,原樣一段一行
-會讓單一時間點顯示一大段歌詞。對齊後依字級時間把段切成短行,門檻可用 env 調整:
+**切行**(`/align` 與 `/transcribe` 共用同一套規則,`lyrics_text.split_aligned_lines`):
+whisperx 會把語音合併成最長約 30 秒的段,原樣一段一行會讓單一時間點顯示一大段
+歌詞。對齊後依字級時間切成短行:
+
+1. 原有的換行(`/align` 的使用者分行、`/transcribe` 的 ASR 段)一律保留。
+2. **必斷**:句末標點(`。．！？!?‼` 等及句點,不含 `...` 與小數點)之後;
+   停頓 ≥ `LYRICS_LINE_LONG_GAP_SECONDS`(不論行長)。
+3. 句子過長(字 / 詞數或秒數超過上限)才在子句標點(`，；：…—～,;:~`,不含列舉的
+   `、`)或停頓 ≥ `LYRICS_LINE_GAP_SECONDS` 處斷,並貪婪合併避免碎行;兩者都沒有
+   就保留長行,不在詞 / 句中間硬切。
+4. 一段若剛好是「一段拉丁字母 + 一段其他文字」(語系只切換一次,如 `Apple蘋果`、
+   `我愛你baby`)在切換處斷;句中夾外文(`給我一個kiss吧`)不斷,數字不算語系。
+5. 標點跟著前一段,不會成為新行開頭。停頓以有時間的字計(字典外的字不算)。
 
 | env | 預設 | 說明 |
 |---|---|---|
-| `LYRICS_LINE_GAP_SECONDS` | `0.6` | 相鄰兩字(詞)間隔 ≥ 此秒數就換行(換氣停頓,主規則) |
-| `LYRICS_LINE_MAX_CHARS_CJK` | `14` | 中 / 日文一行最多字數 |
-| `LYRICS_LINE_MAX_WORDS` | `10` | 其他語言一行最多詞數 |
-| `LYRICS_LINE_MAX_SECONDS` | `7` | 一行最長秒數,超過強制換行 |
+| `LYRICS_LINE_LONG_GAP_SECONDS` | `1.5` | 停頓 ≥ 此秒數一律換行 |
+| `LYRICS_LINE_GAP_SECONDS` | `0.6` | 過長的句子:停頓 ≥ 此秒數可作為斷點 |
+| `LYRICS_LINE_MAX_CHARS_CJK` | `14` | 中 / 日文一行字數上限(超過才找斷點) |
+| `LYRICS_LINE_MAX_WORDS` | `10` | 其他語言一行詞數上限(超過才找斷點) |
+| `LYRICS_LINE_MAX_SECONDS` | `7` | 一行秒數上限(超過才找斷點) |
 
 對齊失敗(退回 ASR 段級時間、無字級時間)時不切行。
 

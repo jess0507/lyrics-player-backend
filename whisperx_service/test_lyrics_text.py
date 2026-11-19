@@ -83,55 +83,111 @@ class NormalizeForAlignmentTest(unittest.TestCase):
 
 
 def _split(lines, chars, sep, **kw):
-    params = dict(gap_seconds=0.6, max_chars_cjk=4, max_words=3, max_seconds=100.0)
+    params = dict(max_chars_cjk=4, max_words=3, max_seconds=100.0)
     params.update(kw)
     return split_aligned_lines(lines, chars, sep, **params)
 
 
 class SplitAlignedLinesTest(unittest.TestCase):
-    def test_short_lines_kept_even_with_punct(self):
+    def test_short_lines_kept_with_clause_punct(self):
         lines = ["我愛，你"]
         chars = _timed("我愛，你")
         new_lines, new_chars = _split(lines, chars, "")
         self.assertEqual(new_lines, lines)
         self.assertEqual(new_chars, chars)
 
-    def test_long_cjk_line_split_at_punct(self):
+    def test_sentence_end_always_splits_even_if_short(self):
+        line = "好。走吧！"
+        new_lines, new_chars = _split([line], _timed(line), "")
+        self.assertEqual(new_lines, ["好。", "走吧！"])
+        self.assertEqual(len(new_chars), len("".join(new_lines)))
+
+    def test_fullwidth_period_and_interrobang_split(self):
+        line = "好．走吧‼來"
+        new_lines, _ = _split([line], _timed(line), "")
+        self.assertEqual(new_lines, ["好．", "走吧‼", "來"])
+
+    def test_trailing_sentence_end_keeps_line(self):
+        line = "我愛你。"
+        new_lines, _ = _split([line], _timed(line), "")
+        self.assertEqual(new_lines, [line])
+
+    def test_long_cjk_line_split_at_clause_punct(self):
         line = "我愛你，你愛我"
         new_lines, new_chars = _split([line], _timed(line), "")
         self.assertEqual(new_lines, ["我愛你，", "你愛我"])
         self.assertEqual(len(new_chars), len("".join(new_lines)))
 
-    def test_long_cjk_line_hard_split_by_count(self):
+    def test_long_line_clauses_greedily_merged(self):
+        # 上限 4 字:「一，二，」可併成一行,不會切成四行碎片。
+        line = "一，二，三四，五"
+        new_lines, _ = _split([line], _timed(line), "")
+        self.assertEqual(new_lines, ["一，二，", "三四，五"])
+
+    def test_long_line_without_punct_not_split(self):
         line = "一二三四五六"
         new_lines, _ = _split([line], _timed(line), "")
-        self.assertEqual(new_lines, ["一二三四", "五六"])
+        self.assertEqual(new_lines, [line])
+
+    def test_enumeration_comma_not_a_break(self):
+        line = "春、夏、秋、冬"
+        new_lines, _ = _split([line], _timed(line), "")
+        self.assertEqual(new_lines, [line])
 
     def test_punct_never_starts_line(self):
-        line = "一二三四，五"
+        line = "一二三四，」五"
         new_lines, _ = _split([line], _timed(line), "")
-        self.assertEqual(new_lines, ["一二三四，", "五"])
+        self.assertEqual(new_lines, ["一二三四，」", "五"])
 
-    def test_spaced_split_on_gap_and_preserves_separator_chars(self):
-        line = "a b c d"
+    def test_spaced_sentence_split_preserves_separator_chars(self):
+        line = "a b. c d"
         chars = [
-            _c("a", 0.0, 0.1), _c(" "), _c("b", 0.2, 0.3), _c(" "),
+            _c("a", 0.0, 0.1), _c(" "), _c("b", 0.2, 0.3), _c("."), _c(" "),
             _c("c", 2.0, 2.1), _c(" "), _c("d", 2.2, 2.3),
         ]
         lines = ["x", line]
         all_chars = [_c("x", 0.0, 0.0), _c(" ")] + chars
-        new_lines, new_chars = _split(lines, all_chars, " ")
-        self.assertEqual(new_lines, ["x", "a b", "c d"])
+        new_lines, new_chars = _split(lines, all_chars, " ", max_words=10)
+        self.assertEqual(new_lines, ["x", "a b.", "c d"])
         self.assertEqual(len(new_chars), len(" ".join(new_lines)))
         # "c" 所在新行的首字時間正確對回。
-        offset = len("x a b ")
+        offset = len("x a b. ")
         self.assertEqual(new_chars[offset]["start"], 2.0)
 
-    def test_split_on_duration(self):
-        line = "一二三"
-        chars = [_c("一", 0.0, 1.0), _c("二", 1.1, 2.0), _c("三", 2.1, 5.0)]
+    def test_ellipsis_and_decimal_are_not_sentence_ends(self):
+        self.assertEqual(_split(["oh... yeah"], _timed("oh... yeah"), " ")[0], ["oh... yeah"])
+        self.assertEqual(_split(["我3.5你"], _timed("我3.5你"), "")[0], ["我3.5你"])
+
+    def test_long_pause_splits_even_short_line(self):
+        line = "a b c"
+        chars = [_c("a", 0.0, 0.1), _c(" "), _c("b", 0.2, 0.3), _c(" "), _c("c", 5.0, 5.1)]
+        new_lines, new_chars = _split([line], chars, " ")
+        self.assertEqual(new_lines, ["a b", "c"])
+        self.assertEqual(len(new_chars), len(" ".join(new_lines)))
+
+    def test_short_pause_in_short_line_not_split(self):
+        line = "a b c"
+        chars = [_c("a", 0.0, 0.1), _c(" "), _c("b", 0.2, 0.3), _c(" "), _c("c", 1.0, 1.1)]
+        self.assertEqual(_split([line], chars, " ")[0], [line])
+
+    def test_long_line_split_at_pause(self):
+        # 6 字 > 上限 4,無標點;「四」前停頓 0.8s 可作為斷點。
+        line = "一二三四五六"
+        chars = _timed("一二三") + _timed("四五六", t0=1.4)
+        new_lines, _ = _split([line], chars, "")
+        self.assertEqual(new_lines, ["一二三", "四五六"])
+
+    def test_pause_on_untimed_char_ignored(self):
+        # 無時間的字不算停頓(以前一個有時間的字為準)。
+        line = "一二X三"
+        chars = [_c("一", 0.0, 0.1), _c("二", 0.2, 0.3), _c("X"), _c("三", 0.4, 0.5)]
+        self.assertEqual(_split([line], chars, "", max_chars_cjk=20)[0], [line])
+
+    def test_split_on_duration_at_clause_punct(self):
+        line = "一二，三"
+        chars = [_c("一", 0.0, 1.0), _c("二", 1.1, 2.0), _c("，"), _c("三", 2.1, 5.0)]
         new_lines, _ = _split([line], chars, "", max_chars_cjk=10, max_seconds=3.0)
-        self.assertEqual(new_lines, ["一二", "三"])
+        self.assertEqual(new_lines, ["一二，", "三"])
 
     def test_mixed_english_word_in_cjk_not_cut(self):
         line = "我說hello你好嗎"
@@ -139,10 +195,67 @@ class SplitAlignedLinesTest(unittest.TestCase):
         self.assertIn("hello", "".join(new_lines))
         self.assertTrue(any("hello" in l for l in new_lines))
 
+    def test_script_switch_at_line_edge_splits(self):
+        for line, expected in [
+            ("Apple蘋果", ["Apple", "蘋果"]),
+            ("Baby 我想你", ["Baby", "我想你"]),
+            ("我愛你baby", ["我愛你", "baby"]),
+            ("Oh，愛", ["Oh，", "愛"]),  # 標點跟著前段
+            ("520我愛你", ["520我愛你"]),  # 數字是中性
+        ]:
+            new_lines, new_chars = _split([line], _timed(line), "", max_chars_cjk=20)
+            self.assertEqual(new_lines, expected, line)
+            self.assertEqual(len(new_chars), len("".join(new_lines)))
+
+    def test_foreign_word_mid_sentence_not_split(self):
+        for line in ["給我一個kiss吧", "我說hello你好嗎"]:
+            new_lines, _ = _split([line], _timed(line), "", max_chars_cjk=20)
+            self.assertEqual(new_lines, [line])
+
+    def test_script_switch_in_spaced_language(self):
+        line = "I love you 我愛你"
+        new_lines, new_chars = _split([line], _timed(line), " ", max_words=10)
+        self.assertEqual(new_lines, ["I love you", "我愛你"])
+        self.assertEqual(len(new_chars), len(" ".join(new_lines)))
+
+    def test_script_switch_applies_after_sentence_split(self):
+        line = "好。Apple蘋果"
+        new_lines, _ = _split([line], _timed(line), "", max_chars_cjk=20)
+        self.assertEqual(new_lines, ["好。", "Apple", "蘋果"])
+
+    def test_script_switch_inside_spaced_token(self):
+        # 有空格語言裡沒空格隔開的混寫,也在切換處斷開;標點跟著前段。
+        line = "Absorb,吸收."
+        new_lines, new_chars = _split([line], _timed(line), " ", max_words=10)
+        self.assertEqual(new_lines, ["Absorb,", "吸收."])
+        self.assertEqual(len(new_chars), len(" ".join(new_lines)))
+
+    def test_abbreviations_are_not_sentence_ends(self):
+        for line in [
+            "Mr. Jackson agreed",
+            "Dr. Smith was here",
+            "the U.S. economy",
+            "J. K. Rowling wrote",
+        ]:
+            self.assertEqual(_split([line], _timed(line), " ", max_words=10)[0], [line], line)
+
+    def test_normal_word_before_period_still_ends_sentence(self):
+        for line, expected in [
+            ("I am. You are", ["I am.", "You are"]),
+            ("so am I. Me too", ["so am I.", "Me too"]),
+            ("I said no. Go", ["I said no.", "Go"]),
+        ]:
+            self.assertEqual(
+                _split([line], _timed(line), " ", max_words=10)[0], expected, line
+            )
+
     def test_length_mismatch_returns_input(self):
         lines = ["abc"]
         chars = [_c("a")]
         self.assertEqual(_split(lines, chars, " "), (lines, chars))
+
+
+
 class OutputScriptTest(unittest.TestCase):
     def test_traditional_hints(self):
         for hint in ["zh-TW", "zh_HK", "zh-Hant", "zh-Hant-TW", "yue"]:
