@@ -2,6 +2,11 @@
 
 ## develop
 
+## 1.0.2(20261124)
+- whisperx、aeneas:`/align` 與 `/transcribe` 不再因語系切換斷行
+  - 原因:對齊一次只處理一種語言,另一語系切出去的行沒有可靠時間
+  - `Apple蘋果`、`我愛你baby` 維持一行;輸入原有的換行、標點與停頓斷行規則不變
+
 ## 1.0.1(2026111901)
 - whisperx:`/transcribe` 過濾 ASR 重複幻聽
   - 原因:whisperx 3.1.5 批次解碼不套用 `repetition_penalty`,前奏 / 間奏常解出「啊啊啊…」
