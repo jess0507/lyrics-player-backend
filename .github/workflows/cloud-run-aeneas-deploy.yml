@@ -46,6 +46,11 @@ jobs:
             echo "deploy=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # 部署前先跑完全部單元測試(兩個服務都跑),失敗就不部署。
+      - name: Run all tests
+        if: steps.changes.outputs.deploy == 'true'
+        uses: ./.github/actions/run-tests
+
       # 認證用的 service account 需具備 Cloud Run / Cloud Build / Artifact
       # Registry / Storage(讀部署用 GCS)等部署權限。可沿用既有
       # FIREBASE_SERVICE_ACCOUNT_* secret 並補授權,或另設一組部署專用 SA。

@@ -1,0 +1,32 @@
+name: Run all tests
+description: 跑完 repo 內全部單元測試(whisperx_service + aeneas_service);任何一個失敗就讓呼叫它的 workflow 停在部署之前。
+
+# 三個部署 workflow 共用:各自在「確定要部署」之後、實際部署之前呼叫。
+# 不論這次部署的是哪個服務都跑全部測試。
+#
+# 測試只測純邏輯(whisperx / torch / aeneas 都是延後 import),所以不需要安裝
+# 各服務完整的 requirements.txt,只裝 OpenCC(繁簡轉換的測試沒裝會被 skip)。
+# 新增測試檔只要命名為 test_*.py 放在服務目錄下就會被 discover 到,這裡不用改。
+# functions/ 目前沒有測試;之後有的話在下面加一段。
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # 版本沿用 whisperx_service/requirements.txt 釘的那一行,不在這裡另寫一份。
+    - name: Install test dependencies
+      shell: bash
+      run: pip install "$(grep -E '^opencc-python-reimplemented' whisperx_service/requirements.txt)"
+
+    # 測試以同目錄的模組名稱 import,必須在各服務目錄下執行。
+    - name: Test whisperx_service
+      shell: bash
+      working-directory: whisperx_service
+      run: python -m unittest discover -p 'test_*.py'
+
+    - name: Test aeneas_service
+      shell: bash
+      working-directory: aeneas_service
+      run: python -m unittest discover -p 'test_*.py'

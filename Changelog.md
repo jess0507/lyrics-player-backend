@@ -1,6 +1,10 @@
 # Changelog
 
 ## develop
+- ci:部署前先跑完全部單元測試,失敗就不部署
+  - 三個部署 workflow 共用 `.github/actions/run-tests`,不論部署哪個服務都跑 whisperx、aeneas 全部測試
+  - 該次 tag 沒有要部署的目標時不跑
+- whisperx:補上 `/transcribe` 整條流程的文字保留回歸測試(中 / 日文夾英文不黏字)
 
 ## 1.0.4(2026112402)
 - whisperx:`/transcribe` 修正中文段落裡的英文詞黏在一起

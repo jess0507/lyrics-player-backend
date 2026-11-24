@@ -74,6 +74,11 @@ jobs:
             echo "functions=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # 部署前先跑完全部單元測試(兩個服務都跑),失敗就不部署。
+      - name: Run all tests
+        if: steps.changes.outputs.targets != ''
+        uses: ./.github/actions/run-tests
+
       # Python 版本須與 firebase.json 的 "runtime": "python312" 一致。
       - uses: actions/setup-python@v5
         if: steps.changes.outputs.functions == 'true'

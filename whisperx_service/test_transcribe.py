@@ -4,10 +4,16 @@
 等不依賴 whisperx / torch 的部分(transcriber 對 whisperx 採延後 import):
 
     python -m unittest test_transcribe
+
+:class:`TranscribeTextPreservedTest` 另外把「字級對齊 → 併詞 → 切行 → 片段」整條
+串起來跑(只把對齊模型換成假的),守住「ASR 辨識出的文字原樣出現在歌詞裡」。
 """
 
+import re
 import unittest
+from unittest import mock
 
+import transcriber
 from transcriber import (
     _alignment_segments,
     _clean_segment_text,
@@ -347,6 +353,154 @@ class DropHallucinatedSegmentsTest(unittest.TestCase):
     def test_drops_empty_and_punct_only(self):
         segs = [_seg("", 0.0, 1.0), _seg("……", 1.0, 2.0), _seg("hello", 2.0, 3.0)]
         self.assertEqual([s["text"] for s in drop_hallucinated_segments(segs)], ["hello"])
+
+
+# ── 整條流程:ASR 文字不得在對齊 / 切行過程中被改掉 ─────────────────────
+#
+# 1.0.1 把 /transcribe 改成逐段字級對齊後,中文段落裡的英文詞全黏在一起
+# ("Take it or leave it" → "Takeitorleaveit"):對齊結果併成逐字的 words 時丟掉
+# 空白,切行又以空字串串回去。當時每個函式各自的測試都過,問題出在函式之間的
+# 接縫,所以這裡不測單一函式,而是整條跑完後檢查文字。
+
+_LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9'’]+")
+
+
+def _fake_char_alignments(timed_latin):
+    """假的 ``_char_alignments``:回傳與 ``text`` 逐字等長的時間。
+
+    真的中 / 日文對齊模型字典沒有拉丁字母,英文一律沒有時間
+    (``timed_latin=False``);空白與標點也沒有時間。
+    """
+
+    def fake(_model, _metadata, _audio, text):
+        out = []
+        for i, ch in enumerate(text):
+            timed = ch.isalpha() and (timed_latin or not ch.isascii())
+            out.append(
+                {
+                    "char": ch,
+                    "start": i * 0.05 if timed else None,
+                    "end": i * 0.05 + 0.04 if timed else None,
+                }
+            )
+        return out
+
+    return fake
+
+
+def _run_pipeline(segments, lang, char_alignments=None):
+    """``transcribe()`` 在 ASR 之後的步驟:字級對齊 → 切行 → 片段。"""
+    if char_alignments is None:
+        char_alignments = _fake_char_alignments(timed_latin=lang not in ("zh", "ja"))
+    # 只需要長度與切片(_align_segments 依段的時間取音訊)。
+    audio = range(int((max(s["end"] for s in segments) + 1) * 16000))
+    with mock.patch.object(
+        transcriber, "_load_align_model", return_value=(None, {})
+    ), mock.patch.object(
+        transcriber, "_char_alignments", side_effect=char_alignments
+    ):
+        aligned = transcriber._align_segments(segments, lang, audio)
+    return segments_to_fragments(split_segments_into_lines(aligned, lang))
+
+
+def _segments(*texts):
+    """每段 30 秒、依序排列的 ASR 段。"""
+    return [_seg(t, i * 30.0, i * 30.0 + 29.0) for i, t in enumerate(texts)]
+
+
+class TranscribeTextPreservedTest(unittest.TestCase):
+    def assertTextPreserved(self, segments, fragments):
+        source = " ".join(s["text"] for s in segments)
+        output = " ".join(f["text"] for f in fragments)
+        # 英數詞:一個不多、一個不少、順序相同。兩個詞黏在一起(空白被吃掉)或
+        # 一個詞被切開,token 清單都會不同。
+        self.assertEqual(
+            _LATIN_TOKEN_RE.findall(output), _LATIN_TOKEN_RE.findall(source)
+        )
+        # 其餘字元(中日文、標點)不增不減;只允許空白 / 換行位置不同。
+        self.assertEqual("".join(output.split()), "".join(source.split()))
+        for frag in fragments:
+            self.assertEqual(frag["text"], frag["text"].strip())
+            self.assertNotIn("  ", frag["text"])
+
+    # 取自實際出錯的音檔(中英對照單字教材,Whisper 判定為中文)。
+    _ZH_MIXED = (
+        "银行 One new bank is going to open next Monday. bankrupt",
+        "讲价,讨价还价。That second hand car was a real bargain.",
+        "Take it or leave it, I won't bargain with you.",
+        "地下室 Something roared down in the basement. basis 基础",
+        "Dr. Wilson authorized Nick to write his biography.",
+        "blame 责备 Don't put the blame on me for the mistake.",
+        "BRB Be right back 马上回来 My mom's calling me. BRB. No problem.",
+    )
+
+    def test_zh_keeps_spaces_between_english_words(self):
+        segs = _segments(*self._ZH_MIXED)
+        frags = _run_pipeline(segs, "zh")
+        self.assertTextPreserved(segs, frags)
+
+    def test_zh_each_segment_alone(self):
+        # 逐段各跑一次:哪一種句型壞掉,失敗訊息直接指出來。
+        for text in self._ZH_MIXED:
+            with self.subTest(text=text):
+                segs = _segments(text)
+                self.assertTextPreserved(segs, _run_pipeline(segs, "zh"))
+
+    def test_zh_pure_english_segment_is_unchanged(self):
+        # 中文音檔裡整段都是英文:沒有任何字有時間,文字仍須一字不差。
+        text = "Take it or leave it, I won't bargain with you."
+        frags = _run_pipeline(_segments(text), "zh")
+        self.assertEqual(" ".join(f["text"] for f in frags), text)
+
+    def test_zh_without_latin_has_no_spaces_added(self):
+        segs = _segments("为何临水前,要为自己保留几分。")
+        frags = _run_pipeline(segs, "zh")
+        self.assertTextPreserved(segs, frags)
+        self.assertFalse(any(" " in f["text"] for f in frags))
+
+    def test_ja_keeps_spaces_between_english_words(self):
+        segs = _segments("これは pen です。I have a pen.", "ありがとう Thank you so much")
+        self.assertTextPreserved(segs, _run_pipeline(segs, "ja"))
+
+    def test_spaced_languages(self):
+        cases = {
+            "en": ("Don't blame me for the mistake. Please fill in the blanks.",),
+            "ko": ("사랑해 baby I love you", "오늘 밤 never let me go"),
+            "es": ("No me digas que no, baby I love you.",),
+        }
+        for lang, texts in cases.items():
+            with self.subTest(lang=lang):
+                segs = _segments(*texts)
+                self.assertTextPreserved(segs, _run_pipeline(segs, lang))
+
+    def test_english_with_embedded_cjk(self):
+        segs = _segments("I said 我爱你 to her and she said 谢谢 back.")
+        self.assertTextPreserved(segs, _run_pipeline(segs, "en"))
+
+    def test_irregular_whitespace_is_normalized_not_dropped(self):
+        # Whisper 原文常有開頭空白、連續空白、換行。
+        segs = [_seg("  银行  One new\nbank   is open.  ", 0.0, 10.0)]
+        frags = _run_pipeline(segs, "zh")
+        self.assertEqual(
+            " ".join(f["text"] for f in frags), "银行 One new bank is open."
+        )
+
+    def test_segment_alignment_failure_keeps_text(self):
+        # 單段對齊失敗 → 該段退回 ASR 段級時間,文字原樣保留。
+        def failing(_model, _metadata, _audio, _text):
+            raise RuntimeError("boom")
+
+        segs = _segments("银行 One new bank is going to open next Monday.")
+        frags = _run_pipeline(segs, "zh", char_alignments=failing)
+        self.assertEqual([f["text"] for f in frags], [segs[0]["text"]])
+
+    def test_fully_timed_latin_in_cjk_keeps_spaces(self):
+        # 對齊模型認得拉丁字母(每個字都有時間)時同樣不得黏字。
+        segs = _segments(*self._ZH_MIXED)
+        frags = _run_pipeline(
+            segs, "zh", char_alignments=_fake_char_alignments(timed_latin=True)
+        )
+        self.assertTextPreserved(segs, frags)
 
 
 if __name__ == "__main__":
