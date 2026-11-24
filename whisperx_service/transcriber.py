@@ -252,12 +252,18 @@ def _split_segment(
     × ``oov_unit_seconds`` 從第一個有時間的字往回推,不早於前一子段結束;
     跨段的下限由 :func:`segments_to_fragments` 夾住。
     """
-    words = [
-        (text, _word_time(w, "start"), _word_time(w, "end"))
-        for w in (seg.get("words") or [])
-        for text in [str(w.get("word") or "").strip()]
-        if text
-    ]
+    words: List[tuple] = []
+    for w in seg.get("words") or []:
+        raw = str(w.get("word") or "")
+        text = raw.strip()
+        if text:
+            words.append((text, _word_time(w, "start"), _word_time(w, "end")))
+        elif raw and separator == "" and words and words[-1][0] != " ":
+            # 中 / 日文以空字串串接,原文的空白(夾雜的英文詞之間:"take it or
+            # leave it")得自己留著,否則整句英文黏成一串。無時間、不算單元。
+            words.append((" ", None, None))
+    while words and words[-1][0] == " ":
+        words.pop()
     if not words:
         return [seg]
 
@@ -367,7 +373,9 @@ def chars_to_words(text: str, chars: List[dict], separator: str) -> List[dict]:
     """把逐字對齊結果併成 whisperx 同形的 ``words``(純函式,可單元測試)。
 
     ``chars`` 與 ``text`` 逐字對應(``_char_alignments`` 的輸出,字典外的字
-    start / end 為 None)。中 / 日文(``separator == ""``)每個非空白字一個 word;
+    start / end 為 None)。中 / 日文(``separator == ""``)每個非空白字一個 word,
+    字與字之間的空白另留一個無時間的 ``" "`` word(夾雜的英文詞靠它分開,
+    :func:`_split_segment` 以空字串串接時才不會黏在一起);
     其餘語言以空白分詞,詞的 ``start`` 取第一個有時間的字、``end`` 取最後一個。
     整詞無時間則不帶 start / end(交給 :func:`_split_segment` 處理字典外字)。
     """
@@ -384,9 +392,15 @@ def chars_to_words(text: str, chars: List[dict], separator: str) -> List[dict]:
         words.append(word)
 
     if separator == "":
+        pending_space = False
         for c in chars:
-            if not c["char"].isspace():
-                emit([c])
+            if c["char"].isspace():
+                pending_space = bool(words)  # 開頭的空白不留
+                continue
+            if pending_space:
+                words.append({"word": " "})
+                pending_space = False
+            emit([c])
         return words
 
     cur: List[dict] = []

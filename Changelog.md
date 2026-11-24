@@ -2,6 +2,11 @@
 
 ## develop
 
+## 1.0.4(2026112402)
+- whisperx:`/transcribe` 修正中文段落裡的英文詞黏在一起
+  - 原因:辨識為中 / 日文時逐字串接、不加空格,原文英文詞之間的空白被丟掉(1.0.1 改逐段字級對齊後出現)
+  - 保留原文字間的空白,`Take it or leave it` 不再變成 `Takeitorleaveit`
+
 ## 1.0.3(2026112401)
 - whisperx、aeneas、functions:歌詞結果記錄產出它的流程版本,該流程改版後同一首歌 / 同一份歌詞不再沿用舊結果
   - 流程分三條各自計版:`whisperx.transcribe`、`whisperx.align`、`aeneas.align`

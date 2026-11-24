@@ -226,17 +226,33 @@ def _c(ch, start=None, end=None):
 
 
 class CharsToWordsTest(unittest.TestCase):
-    def test_cjk_one_word_per_char_skipping_spaces(self):
-        chars = [_c("你", 0.0, 0.2), _c(" "), _c("好", 0.9, 1.1), _c("3")]
-        words = chars_to_words("你 好3", chars, "")
+    def test_cjk_one_word_per_char_keeping_inner_spaces(self):
+        chars = [_c(" "), _c("你", 0.0, 0.2), _c(" "), _c("好", 0.9, 1.1), _c("3"), _c(" ")]
+        words = chars_to_words(" 你 好3 ", chars, "")
         self.assertEqual(
             words,
             [
                 {"word": "你", "start": 0.0, "end": 0.2},
+                {"word": " "},  # 字間空白保留(無時間);頭尾的不留
                 {"word": "好", "start": 0.9, "end": 1.1},
                 {"word": "3"},  # 字典外:無時間
             ],
         )
+
+    def test_cjk_segment_keeps_spaces_between_latin_words(self):
+        # 中文段夾英文:英文詞之間的空白要留著,不能黏成 "takeitorleaveit"。
+        text = "讲价 Take it or leave it, I won't bargain."
+        chars = [_c(ch) for ch in text]
+        chars[0], chars[1] = _c("讲", 0.0, 0.3), _c("价", 0.3, 0.6)
+        seg = {
+            "text": text,
+            "start": 0.0,
+            "end": 5.0,
+            "words": chars_to_words(text, chars, ""),
+        }
+        lines = split_segments_into_lines([seg], "zh")
+        self.assertEqual("".join(l["text"] for l in lines), text)
+        self.assertEqual(len(lines), 1)
 
     def test_spaced_language_groups_by_whitespace(self):
         text = "hi, you"
