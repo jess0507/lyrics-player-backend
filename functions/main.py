@@ -55,6 +55,40 @@ def _service_url_for(engine: str) -> str:
         return _WHISPERX_SERVICE_URL
     return _ALIGN_SERVICE_URL
 
+
+# client 端傳來的 engine 值 → 實際處理的服務名(與 ``_service_url_for`` 同一套
+# 路由),即 ``system/backendVersions`` 上的第一層欄位名。
+def _service_name_for(engine: str) -> str:
+    if engine == "whisperx" and _WHISPERX_SERVICE_URL:
+        return "whisperx"
+    return "aeneas"
+
+
+def _current_backend_version(service: str, pipeline: str) -> str | None:
+    """處理流程目前部署的版本,格式同結果快照的 ``backendVersion``:
+    ``<服務>.<pipeline>@<版本>``(如 ``whisperx.transcribe@1.0.2``)。
+
+    流程共三條,各有自己的版本(該流程程式最後一次修改所屬的版本 tag):
+    ``whisperx.transcribe`` / ``whisperx.align`` / ``aeneas.align``。各服務啟動時
+    把版本寫到 ``system/backendVersions.{服務}.{pipeline}``,產出的結果也附上同一
+    個值。沿用既有結果前拿兩者比對:不同(別的流程產出、該流程改版過、或舊
+    結果沒有版本)就不沿用、重新處理。
+
+    讀不到(服務尚未以帶版本的方式部署過、或 Firestore 讀取失敗)回 None,
+    代表無從比對,此時維持舊行為、照常沿用。
+    """
+    try:
+        doc = firestore.client().collection("system").document("backendVersions").get()
+    except Exception:
+        log.exception("讀取後端版本失敗(%s.%s)", service, pipeline)
+        return None
+    versions = (doc.to_dict() or {}).get(service) if doc.exists else None
+    version = versions.get(pipeline) if isinstance(versions, dict) else None
+    if not isinstance(version, str) or not version:
+        return None
+    return f"{service}.{pipeline}@{version}"
+
+
 # Cloud Tasks 佇列所在區域;預設同 Functions region,可用環境變數覆寫
 # (佇列與 Cloud Run 服務可能部署在不同區域)。
 _TASKS_LOCATION = os.environ.get("TASKS_LOCATION", _REGION)
@@ -106,6 +140,10 @@ def _require_uid(req: https_fn.CallableRequest) -> str:
 # - generate:``trackId`` + ``kind`` 相同,且 ``content`` 非空 → 沿用。
 # - align:``trackId`` + ``kind`` + ``lyricsSha256`` 都相同,且 ``content`` 非空 →
 #   沿用。歌詞改過(例如重新貼上)就是不同任務,一定重新對齊。
+# 另外結果的 ``backendVersion``(Cloud Run 存結果時寫入)必須等於處理流程
+# (``whisperx.transcribe`` / ``whisperx.align`` / ``aeneas.align``)的現行版本
+# (見 ``_current_backend_version``):該流程改版後,舊版產出的結果不再沿用,
+# 同一首歌 / 同一份歌詞再送一次就重新辨識 / 對時。
 # Cloud Run 存結果時以 merge 寫入,這些欄位會一直保留在文件上。
 # ``trackId`` 在更早期版本曾是 jobId 或 sha1 指紋,現在一律代表音檔 SHA-256;
 # 格式不符(非 64 碼 hex)就當作沒帶,照常派工、不查沿用。``fingerprint``
@@ -200,13 +238,22 @@ def _same_track_query(uid: str, kind: str, track_id: str):
 
 
 def _find_succeeded_task(
-    uid: str, kind: str, track_id: str, lyrics_sha256: str | None
+    uid: str,
+    kind: str,
+    track_id: str,
+    lyrics_sha256: str | None,
+    backend_version: str | None,
 ) -> dict | None:
     """同一個任務曾**處理成功**(``status == "done"`` 且 ``content`` 非空)的結果。
-    ``lyrics_sha256`` 有值(align)時歌詞 SHA-256 也必須相同。"""
+    ``lyrics_sha256`` 有值(align)時歌詞 SHA-256 也必須相同;``backend_version``
+    有值時只找該版本後端產出的結果(舊版 / 沒有版本的結果不算)。"""
     query = _same_track_query(uid, kind, track_id).where(
         filter=FieldFilter("status", "==", "done")
     )
+    if backend_version is not None:
+        query = query.where(
+            filter=FieldFilter("backendVersion", "==", backend_version)
+        )
     if lyrics_sha256 is not None:
         query = query.where(
             filter=FieldFilter("lyricsSha256", "==", lyrics_sha256)
@@ -247,16 +294,20 @@ def _reuse_succeeded_task(
     track_id: str | None,
     lyrics_sha256: str | None,
     title,
+    backend_version: str | None,
 ) -> bool:
     """同一個任務曾處理成功:把結果複製到這次的任務文件並回 True(呼叫端直接
     回應 cached);同一首歌同種類的任務仍在處理中則丟 busy;其餘回 False
     (照常派工)。沒帶合法的 ``trackId``(client 算不出音檔 SHA-256)一律回 False。
 
     「同一個任務」:``trackId`` + ``kind`` 相同;align 另需 ``lyricsSha256`` 相同
-    (``lyrics_sha256`` 由呼叫端保證 align 一定有值)。"""
+    (``lyrics_sha256`` 由呼叫端保證 align 一定有值)。``backend_version`` 有值時
+    結果還必須是該版本後端產出的,否則視為沒處理過、重新派工。"""
     if track_id is None:
         return False
-    succeeded = _find_succeeded_task(uid, kind, track_id, lyrics_sha256)
+    succeeded = _find_succeeded_task(
+        uid, kind, track_id, lyrics_sha256, backend_version
+    )
     if succeeded is not None:
         now = _now_ms()
         # 與 Cloud Run 的 _save_lyrics_snapshot 同一份 schema,client 監聽到
@@ -271,6 +322,12 @@ def _reuse_succeeded_task(
                 "status": "done",
                 "statusUpdatedAt": now,
                 **_task_keys(kind, track_id, lyrics_sha256),
+                # 版本跟著結果走,這份複本之後也照同一套規則判斷能否沿用。
+                **(
+                    {"backendVersion": succeeded["backendVersion"]}
+                    if succeeded.get("backendVersion")
+                    else {}
+                ),
             }
         )
         return True
@@ -375,10 +432,16 @@ def _ensure_quota(uid: str, quota_seconds: int | None, duration: float | None) -
             },
         )
 
-def _has_generated_snapshot(uid: str, job_id: str) -> bool:
+def _has_generated_snapshot(
+    uid: str, job_id: str, backend_version: str | None
+) -> bool:
     """檢查 ``user/{uid}/lyrics/{jobId}`` 是否已有對時 / 自動產生過的快照
     (``source=generated`` 且有內文)。已有的話代表這首歌處理過,不必重跑——
     ``align_lyrics`` / ``generate_lyrics`` 據此直接回應成功、不再派工。
+
+    ``backend_version`` 有值時,快照的 ``backendVersion`` 還必須與它相同;
+    舊版後端產出(或沒有版本)的快照視為沒處理過,回 False 讓呼叫端重新派工
+    (新結果會以 merge 覆寫掉舊內文)。
     """
     doc = (
         firestore.client()
@@ -391,7 +454,18 @@ def _has_generated_snapshot(uid: str, job_id: str) -> bool:
     if not doc.exists:
         return False
     data = doc.to_dict() or {}
-    return data.get("source") == "generated" and bool(data.get("content"))
+    if data.get("source") != "generated" or not data.get("content"):
+        return False
+    if backend_version is not None and data.get("backendVersion") != backend_version:
+        log.info(
+            "既有快照的後端版本不同,重新處理(uid=%s jobId=%s 快照=%s 現行=%s)",
+            uid,
+            job_id,
+            data.get("backendVersion"),
+            backend_version,
+        )
+        return False
+    return True
 
 
 _IN_PROGRESS_STATUSES = {
@@ -536,9 +610,10 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
 
     回應語意:
         - 同一個任務(同任務種類、同 ``trackId``、同 ``lyricsSha256``)上次處理成功
-          且有內文 → 複製到這次的任務文件
+          且有內文、且是**同一條流程的現行版本**產出的 → 複製到這次的任務文件
           (``status = "done"``)並回 ``{"saved": True, "cached": True}``,
-          不派工、不扣配額;另外也會看任務文件本身是否已有快照。
+          不派工、不扣配額;另外也會看任務文件本身是否已有快照。後端改版後
+          (結果的 ``backendVersion`` 與處理流程的現行版本不同)不沿用,重新派工。
         - 同一首歌(同 ``trackId``)仍在處理中 → ``failed-precondition``(``details.code = "busy"``)。
         - 否則派工成功 → ``{"saved": True, "queued": True}``,**此時歌詞尚未
           產生完成**,client 不應假設此刻已可讀到內容。
@@ -576,7 +651,11 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "invalid_request"},
         )
 
-    if _has_generated_snapshot(uid, str(job_id)):
+    # 處理這次請求的流程(whisperx.align / aeneas.align)目前的版本;既有結果是
+    # 別的流程或別的版本產出的就不沿用。
+    backend_version = _current_backend_version(_service_name_for(engine), "align")
+
+    if _has_generated_snapshot(uid, str(job_id), backend_version):
         _write_done_status(uid, str(job_id))
         return {"saved": True, "cached": True}
 
@@ -587,7 +666,7 @@ def align_lyrics(req: https_fn.CallableRequest) -> dict:
     # 確保 align 的沿用一定比對到歌詞內容。
     lyrics_sha256 = _valid_sha256(data.get("lyricsSha256")) or _lines_sha256(lines)
     if _reuse_succeeded_task(
-        uid, str(job_id), _KIND_ALIGN, track_id, lyrics_sha256, title
+        uid, str(job_id), _KIND_ALIGN, track_id, lyrics_sha256, title, backend_version
     ):
         return {"saved": True, "cached": True}
 
@@ -689,7 +768,10 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
             details={"code": "invalid_request"},
         )
 
-    if _has_generated_snapshot(uid, str(job_id)):
+    # 轉寫固定由 whisperx.transcribe 處理;既有結果是別的版本產出的就不沿用。
+    backend_version = _current_backend_version("whisperx", "transcribe")
+
+    if _has_generated_snapshot(uid, str(job_id), backend_version):
         _write_done_status(uid, str(job_id))
         return {"saved": True, "cached": True}
 
@@ -697,7 +779,7 @@ def generate_lyrics(req: https_fn.CallableRequest) -> dict:
         return {"saved": True, "queued": True}
 
     if _reuse_succeeded_task(
-        uid, str(job_id), _KIND_GENERATE, track_id, None, title
+        uid, str(job_id), _KIND_GENERATE, track_id, None, title, backend_version
     ):
         return {"saved": True, "cached": True}
 

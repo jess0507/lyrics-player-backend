@@ -62,23 +62,46 @@ queued → downloading_audio → transcribing → saving → done
 | `addedAt` | 毫秒 epoch(int) |
 | `status` | `"done"` |
 | `statusUpdatedAt` | 毫秒 epoch(int) |
+| `backendVersion` | 產出這份結果的流程與版本,`<服務>.<pipeline>@<版本>`(如 `whisperx.transcribe@1.0.2`);服務沒設定版本(本機 / 測試)時不寫 |
 
 其他狀態(以及 `functions/main.py` 命中既有快照時補寫的 `done`)都是 `merge=True`,只動 `status` / `statusUpdatedAt` / `error`,**不會改變 `source`**。也就是處理期間 `source` 維持文件原有的值(例如使用者先前匯入的歌詞來源),只有成功到 `done` 時才變成 `generated`。
 
 ## 後端如何使用這些狀態
 
-`functions/main.py` 在 `align_lyrics` / `generate_lyrics` 派工前依序檢查:
+`functions/main.py` 在 `align_lyrics` / `generate_lyrics` 派工前先讀出處理流程的現行版本(見下方「後端版本」),再依序檢查:
 
-1. **任務文件本身已有產物**(同一個 jobId 重送,或已發佈版 client 以舊 trackId 為文件 id 時會命中):`source == "generated"` 且 `content` 非空 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
+1. **任務文件本身已有產物**(同一個 jobId 重送,或已發佈版 client 以舊 trackId 為文件 id 時會命中):`source == "generated"` 且 `content` 非空、且 `backendVersion` 等於現行版本 → 直接回 `{"saved": true, "cached": true}`,不派工、不扣配額。此判斷只看 `source` 與 `content`,不看 `status`。回應前會以 merge 把該文件的 `status` 補寫成 `done`(附 `statusUpdatedAt`、清掉 `error`),讓監聽 status 的前端能收到終態;舊快照可能沒有 `status`、或殘留上一次的 `failed`。
 2. **任務文件本身進行中**:`status` 屬於 `queued` / `downloading_audio` / `aligning` / `transcribing` / `saving` → 回 `{"saved": true, "queued": true}`,不重複派工、不扣配額。
 3. **依任務種類 + SHA-256 沿用**(client 有帶合法 `trackId` 時):直接 query `user/{uid}/lyrics` 裡 `trackId == 音檔 SHA-256` 且 `kind == 任務種類` 的任務文件(align 另加 `lyricsSha256 == 歌詞 SHA-256`):
-   - 有一份 `status == "done"` 且 `content` 非空(**處理成功過**)→ 把 `title` / `format` / `source` / `content` 複製到這次的任務文件(同時寫入 `trackId` / `lyricsSha256` / `kind`、`status = "done"`),回 `{"saved": true, "cached": true}`,不派工、不扣配額。align 的歌詞改過(`lyricsSha256` 不同)就不會沿用,一定重新對齊。
+   - 有一份 `status == "done"` 且 `content` 非空、且 `backendVersion` 等於現行版本(**同一條流程的現行版本處理成功過**)→ 把 `title` / `format` / `source` / `content` / `backendVersion` 複製到這次的任務文件(同時寫入 `trackId` / `lyricsSha256` / `kind`、`status = "done"`),回 `{"saved": true, "cached": true}`,不派工、不扣配額。align 的歌詞改過(`lyricsSha256` 不同)就不會沿用,一定重新對齊。
    - 同一首歌同種類(只比 `trackId` + `kind`,不比歌詞)有一份仍在進行中(且 `statusUpdatedAt` 在 30 分鐘內)→ 丟 `busy`(`failed-precondition`)。
-   - 其餘(沒有紀錄、都失敗或卡住)→ 照常派工。
+   - 其餘(沒有紀錄、都失敗或卡住、只有別的流程 / 舊版的結果)→ 照常派工。
 4. **配額**:本月額度用盡 → 丟 `quota_exceeded`。
 5. 通過後派工到 Cloud Tasks,再寫 `status = "queued"`(有 `trackId` 時一併寫入 `trackId` / `lyricsSha256` / `kind`)。
 
 每個 jobId 文件都是一個獨立的任務;沒有另外的快取集合,沿用時比對的就是任務文件本身的欄位。
+
+### 後端版本
+
+處理流程共三條,各有自己的版本:
+
+| 流程 | 入口 | 版本環境變數 |
+|---|---|---|
+| `whisperx.transcribe` | `generate_lyrics` → whisperx `/transcribe` | `TRANSCRIBE_PIPELINE_VERSION` |
+| `whisperx.align` | `align_lyrics`(`engine = whisperx`)→ whisperx `/align` | `ALIGN_PIPELINE_VERSION` |
+| `aeneas.align` | `align_lyrics`(其餘)→ aeneas `/align` | `ALIGN_PIPELINE_VERSION` |
+
+某條流程改版後,它舊版產出的結果不再沿用:同一首歌 / 同一份歌詞再送一次會重新辨識 / 對時,照常扣配額。沒動到的流程版本不變,結果照常沿用。
+
+- **版本的定義**:該流程的程式**最後一次修改**所屬的最早版本 tag(如 `1.0.2`)。由 Cloud Run 部署 workflow 從 git 歷史算出(`git log -1 -- <流程的檔案>` → 涵蓋該 commit 的最早 tag),以 `--update-env-vars` 帶入;那筆 commit 尚未被任何 tag 涵蓋(手動觸發未發版的 commit)時退回 `git describe`(如 `1.0.2-3-gabc1234`)。
+- **各流程算進哪些檔案**:以排除方式定義,新增的檔案預設算進去。
+  - `whisperx.transcribe`:`whisperx_service/` 全部,扣掉測試、`*.md`、本機工具(`*_local.py`、`api_smoke.py`、`dev_test.sh`)、`storage-lifecycle.json`。
+  - `whisperx.align`:同上,再扣掉 `transcriber.py`。只改 `transcriber.py` 不會讓對時結果失效;改 `aligner.py` / `lrc.py` / `lyrics_text.py` / `main.py` / `requirements.txt` / `Dockerfile` 兩條都會變。
+  - `aeneas.align`:`aeneas_service/` 全部,扣掉測試、`*.md`、`storage-lifecycle.json`。
+- **結果上的版本**:Cloud Run 寫 `done` 快照時附上 `backendVersion`(`<服務>.<pipeline>@<版本>`)。
+- **現行版本**:各服務容器啟動時把各流程的版本寫到 `system/backendVersions`(`{whisperx: {align, transcribe}, aeneas: {align}}`;`firestore.rules` 不開放 client 存取)。`functions/main.py` 派工前讀這份文件,組出處理這次請求的流程的 `backendVersion` 來比對。
+- **比對規則**:結果的 `backendVersion` 與現行值字串完全相同才沿用;流程不同(例如 aeneas 對時的結果遇到 whisperx 對時的請求)、版本不同、或結果沒有 `backendVersion`(加入版本前的舊結果)都重新處理。
+- **讀不到現行版本**(服務尚未以帶版本的方式部署過、或讀取失敗)→ 無從比對,維持舊行為照常沿用。
 
 ### 比對用的欄位
 
@@ -88,6 +111,7 @@ queued → downloading_audio → transcribing → saving → done
 | `lyricsSha256` | `functions/main.py`(align 派工 / 沿用時) | 送對時的歌詞行 SHA-256:`sha256(utf8("\n".join(lines)))`;client 沒帶 / 格式不符時由 `lines` 自算 |
 | `fingerprint` | 舊版 `functions/main.py` | **deprecated**。舊的 sha1 頭尾指紋,只留在舊文件上;client 帶的 `fingerprint` 參數一律忽略,不再寫入也不再比對 |
 | `kind` | `functions/main.py`(派工 / 沿用時) | 任務種類 `generate` / `align` |
+| `backendVersion` | `whisperx_service` / `aeneas_service`(存結果時);`functions/main.py`(沿用時跟著結果複製) | 產出結果的流程與版本,見上方「後端版本」 |
 
 Cloud Run 存結果(`done`)與更新狀態都以 merge 寫入,這些欄位會一直留在任務文件上。查詢只有等值 / `in` 條件,若 Firestore 回報需要 composite index,依錯誤訊息裡的連結建立即可。
 

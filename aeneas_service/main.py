@@ -59,6 +59,43 @@ STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 
 
+# 各處理流程(pipeline)各自的版本:該流程的程式**最後一次修改**所屬的版本 tag
+# (如 ``1.0.2``),由部署 workflow 從 git 歷史算出、以 ``ALIGN_PIPELINE_VERSION`` 帶入。
+# 結果快照會附上 ``backendVersion``(``aeneas.<pipeline>@<版本>``);
+# ``functions/main.py`` 沿用既有結果前拿它跟 ``system/backendVersions`` 上的現行
+# 版本比對,不同就重新處理。未設定(本機 / 測試)時不寫版本、也不發佈。
+_BACKEND_SERVICE = "aeneas"
+_PIPELINE_VERSIONS = {
+    "align": os.environ.get("ALIGN_PIPELINE_VERSION", "").strip(),
+}
+
+
+def _backend_version(pipeline: str) -> str | None:
+    """寫進結果快照的 ``backendVersion``;該流程沒設定版本回 None。"""
+    version = _PIPELINE_VERSIONS.get(pipeline)
+    return f"{_BACKEND_SERVICE}.{pipeline}@{version}" if version else None
+
+
+def _publish_backend_version() -> None:
+    """把各流程的現行版本寫到 ``system/backendVersions.{服務名}.{pipeline}``,讓
+    ``functions/main.py`` 派工前讀得到(它與本服務各自部署,無法在建置時得知)。
+    容器啟動時執行一次;失敗只記 log,不影響服務啟動。"""
+    versions = {p: v for p, v in _PIPELINE_VERSIONS.items() if v}
+    if not versions:
+        return
+    try:
+        from google.cloud import firestore
+
+        firestore.Client().collection("system").document("backendVersions").set(
+            {_BACKEND_SERVICE: versions}, merge=True
+        )
+    except Exception:
+        log.exception("發佈後端版本失敗(versions=%s)", versions)
+
+
+_publish_backend_version()
+
+
 def _error(code: str, message: str, status: int):
     """統一錯誤格式,client 依 ``code`` 映射 l10n。"""
     return jsonify({"error": {"code": code, "message": message}}), status
@@ -244,7 +281,9 @@ def _fail(uid, track_id, code: str, message: str, http_status: int):
     return _error(code, message, http_status)
 
 
-def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None:
+def _save_lyrics_snapshot(
+    uid: str, track_id: str, title: str, lrc: str, pipeline: str
+) -> None:
     """把對時結果寫回 ``user/{uid}/lyrics/{trackId}``,與 App 端既有的歌詞
     備份 schema(sync v5,見 ``lib/core/sync/lyrics_sync.dart``)一致
     (``title`` / ``format`` / ``source`` / ``content`` / ``addedAt`` 毫秒
@@ -277,6 +316,9 @@ def _save_lyrics_snapshot(uid: str, track_id: str, title: str, lrc: str) -> None
             "status": STATUS_DONE,
             "statusUpdatedAt": int(datetime.now(timezone.utc).timestamp() * 1000),
             "error": firestore.DELETE_FIELD,
+            # 產出這份結果的流程與版本(``pipeline``:``align`` / ``transcribe``);
+            # 沒設定就清掉,避免沿用文件上舊的版本。
+            "backendVersion": _backend_version(pipeline) or firestore.DELETE_FIELD,
         },
         merge=True,
     )
@@ -380,7 +422,9 @@ def align_endpoint():
     if uid and track_id:
         _write_status(str(uid), str(track_id), STATUS_SAVING)
         try:
-            _save_lyrics_snapshot(str(uid), str(track_id), str(title or ""), result["lrc"])
+            _save_lyrics_snapshot(
+                str(uid), str(track_id), str(title or ""), result["lrc"], "align"
+            )
         except Exception as exc:
             # 寫入失敗回 5xx,讓 Cloud Tasks 依佇列重試設定重送;不吞例外,
             # 否則會有「對時算完了但沒人知道、也沒存到」的靜默遺失。

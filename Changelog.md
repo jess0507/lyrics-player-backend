@@ -2,6 +2,14 @@
 
 ## develop
 
+## 1.0.3(2026112401)
+- whisperx、aeneas、functions:歌詞結果記錄產出它的流程版本,該流程改版後同一首歌 / 同一份歌詞不再沿用舊結果
+  - 流程分三條各自計版:`whisperx.transcribe`、`whisperx.align`、`aeneas.align`
+  - 版本為該流程程式最後一次修改所屬的版本 tag,部署時從 git 歷史算出,以 `TRANSCRIBE_PIPELINE_VERSION` / `ALIGN_PIPELINE_VERSION` 帶入
+  - 結果快照新增 `backendVersion`(如 `whisperx.transcribe@1.0.2`)
+  - `align_lyrics` / `generate_lyrics` 沿用前比對該流程的現行版本(`system/backendVersions`),流程不同、版本不同或沒有版本就重新辨識 / 對時
+  - 讀不到現行版本時維持原本的沿用行為
+
 ## 1.0.2(20261124)
 - whisperx、aeneas:`/align` 與 `/transcribe` 不再因語系切換斷行
   - 原因:對齊一次只處理一種語言,另一語系切出去的行沒有可靠時間

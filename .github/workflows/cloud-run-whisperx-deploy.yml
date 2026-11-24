@@ -64,6 +64,34 @@ jobs:
       - name: Deploy to Cloud Run
         if: steps.changes.outputs.deploy == 'true'
         run: |
+          # 各處理流程的版本 = 該流程的程式「最後一次修改」所屬的最早版本 tag(如 1.0.2);
+          # 那筆 commit 還沒被任何 tag 涵蓋(手動觸發未發版的 commit)時退回
+          # git describe(如 1.0.2-3-gabc1234)。服務把它寫進每份結果的 backendVersion,
+          # 該流程改版後舊結果不再沿用;沒動到的流程版本不變、結果照常沿用。
+          # 路徑以「排除」方式列出:新增的檔案預設算進流程,不會漏算。
+          pipeline_version() {
+            commit=$(git log -1 --format=%H "$GITHUB_SHA" -- "$@")
+            tag=$(git tag --list '*.*.*' --contains "$commit" --sort=version:refname | head -n 1)
+            if [ -n "$tag" ]; then
+              echo "$tag"
+            else
+              git describe --tags --always "$commit"
+            fi
+          }
+          # 不影響輸出的檔案:測試、文件、本機工具。
+          common=(
+            ':(exclude)whisperx_service/test_*.py'
+            ':(exclude)whisperx_service/*.md'
+            ':(exclude)whisperx_service/*_local.py'
+            ':(exclude)whisperx_service/api_smoke.py'
+            ':(exclude)whisperx_service/dev_test.sh'
+            ':(exclude)whisperx_service/storage-lifecycle.json'
+          )
+          # /align 不經過 transcriber.py;/transcribe 會用到 aligner.py(逐段對齊),故全算。
+          align_version=$(pipeline_version whisperx_service "${common[@]}" ':(exclude)whisperx_service/transcriber.py')
+          transcribe_version=$(pipeline_version whisperx_service "${common[@]}")
+          echo "whisperx.align=$align_version whisperx.transcribe=$transcribe_version"
+          # 用 --update-env-vars(合併),不要用 --set-env-vars(會清掉其他環境變數)。
           gcloud run deploy whisperx-align \
             --source whisperx_service \
             --project seek-player-f724e \
@@ -73,4 +101,5 @@ jobs:
             --concurrency 1 \
             --timeout 600 \
             --no-allow-unauthenticated \
+            --update-env-vars "ALIGN_PIPELINE_VERSION=$align_version,TRANSCRIBE_PIPELINE_VERSION=$transcribe_version" \
             --quiet

@@ -64,6 +64,26 @@ jobs:
       - name: Deploy to Cloud Run
         if: steps.changes.outputs.deploy == 'true'
         run: |
+          # 各處理流程的版本 = 該流程的程式「最後一次修改」所屬的最早版本 tag(如 1.0.2);
+          # 那筆 commit 還沒被任何 tag 涵蓋(手動觸發未發版的 commit)時退回
+          # git describe(如 1.0.2-3-gabc1234)。服務把它寫進每份結果的 backendVersion,
+          # 該流程改版後舊結果不再沿用;沒動到的流程版本不變、結果照常沿用。
+          # 路徑以「排除」方式列出:新增的檔案預設算進流程,不會漏算。
+          pipeline_version() {
+            commit=$(git log -1 --format=%H "$GITHUB_SHA" -- "$@")
+            tag=$(git tag --list '*.*.*' --contains "$commit" --sort=version:refname | head -n 1)
+            if [ -n "$tag" ]; then
+              echo "$tag"
+            else
+              git describe --tags --always "$commit"
+            fi
+          }
+          align_version=$(pipeline_version aeneas_service \
+            ':(exclude)aeneas_service/test_*.py' \
+            ':(exclude)aeneas_service/*.md' \
+            ':(exclude)aeneas_service/storage-lifecycle.json')
+          echo "aeneas.align=$align_version"
+          # 用 --update-env-vars(合併),不要用 --set-env-vars(會清掉其他環境變數)。
           gcloud run deploy aeneas-align \
             --source aeneas_service \
             --project seek-player-f724e \
@@ -72,4 +92,5 @@ jobs:
             --cpu 2 \
             --timeout 600 \
             --no-allow-unauthenticated \
+            --update-env-vars "ALIGN_PIPELINE_VERSION=$align_version" \
             --quiet
