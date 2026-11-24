@@ -10,7 +10,7 @@
 2. **文字系統統計**(:func:`script_units`):供 ``aligner.detect_language``
    依歌詞判斷語言(拉丁以單字計,漢字 / 假名 / 諺文逐字計)。
 3. **只看文字的切行**(:func:`split_spans`):句末標點後斷;字數過長才在子句
-   標點斷;一行內語系只切換一次時在切換處斷。whisperx 的停頓 / 秒數規則需要
+   標點斷;不因語系切換斷行(aeneas 一次只用一種語言合成)。whisperx 的停頓 / 秒數規則需要
    字級時間,不移植。
 """
 
@@ -148,8 +148,8 @@ def script_units(lines: List[str]) -> Dict[str, int]:
     return counts
 
 
-# ── 只看文字的切行(同 whisperx 的 _break_kind / _is_abbreviation / _script_cut)──
-# 單元:連續英數為一單元,其餘每個非空白字一單元(遮蔽字元也是一單元,語系中性)。
+# ── 只看文字的切行(同 whisperx 的 _break_kind / _is_abbreviation)──
+# 單元:連續英數為一單元,其餘每個非空白字一單元(遮蔽字元也是一單元)。
 _UNIT_RE = re.compile(r"[A-Za-z0-9'’]+|\S")
 
 # 句末標點:行內出現即斷行。"." 另判(排除 "..."、小數點與縮寫)。
@@ -204,38 +204,6 @@ def _break_kind(line: str, end: int) -> Optional[str]:
     return None
 
 
-def _unit_script(text: str) -> Optional[str]:
-    """單元的語系:``"latin"`` / ``"other"``;數字、標點、遮蔽字元為 None(中性)。"""
-    for ch in text:
-        if ch.isalpha():
-            return "latin" if "LATIN" in unicodedata.name(ch, "") else "other"
-    return None
-
-
-def _script_cut(text: str) -> Optional[Tuple[int, int]]:
-    """``text`` 若剛好是「一段拉丁 + 一段非拉丁」(語系只切換一次),回傳
-    ``(第一段結尾, 第二段開頭)`` 的字元位置;否則 None。
-
-    只處理行首 / 行尾的外文("Apple蘋果"、"Absorb,吸收."、"我愛你baby");
-    句中夾外文("給我一個kiss吧" 切換兩次)不動。中性單元(數字、標點)跟前段。
-    """
-    runs = 0
-    prev_script: Optional[str] = None
-    last_end = 0
-    cut: Optional[Tuple[int, int]] = None
-    for m in _UNIT_RE.finditer(text):
-        script = _unit_script(m.group())
-        if script is not None and script != prev_script:
-            runs += 1
-            if runs == 2:
-                cut = (last_end, m.start())
-            elif runs > 2:
-                return None
-            prev_script = script
-        last_end = m.end()
-    return cut
-
-
 # 一行長度上限(同 whisperx 預設):超過才在子句標點斷。中 / 日文以字計,
 # 其他語言(含韓文,以空格分詞)以詞計。
 LINE_MAX_CHARS_CJK = int(os.environ.get("LYRICS_LINE_MAX_CHARS_CJK", "14"))
@@ -267,8 +235,8 @@ def split_spans(
     2. 斷完的句子若仍過長(見 :func:`line_length`;中 / 日文 > ``max_chars_cjk``
        字,其他 > ``max_words`` 詞),才在**子句標點**(，；：… 等)處斷,且以
        片段為單位貪婪合併:放得下就併在同一行。沒有子句標點就保留長行。
-    3. 每段若是「一段拉丁 + 一段非拉丁」,在切換處斷開(見 :func:`_script_cut`)。
-    4. 標點跟前段,不會成為新行開頭。
+    3. 標點跟前段,不會成為新行開頭。
+    4. 語系切換(拉丁 ↔ 其他文字,如 "Apple蘋果")不是斷點。
 
     範圍可能含前後空白,由呼叫端修整;不需切時回傳單一範圍 ``[(0, len)]``。
     """
@@ -321,15 +289,7 @@ def split_spans(
         if g_start is not None:
             groups.append((g_start, g_end))
 
-    spans: List[Tuple[int, int]] = []
-    for s, e in groups:
-        cut = _script_cut(masked[s:e])
-        if cut is None:
-            spans.append((s, e))
-        else:
-            spans.append((s, s + cut[0]))
-            spans.append((s + cut[1], e))
-    return spans
+    return groups
 
 
 # ── 顯示行 ↔ 對齊行 ─────────────────────────────────────────────────────

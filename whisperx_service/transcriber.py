@@ -268,8 +268,8 @@ def _split_segment(
             chars.extend({"char": c, "start": None, "end": None} for c in separator)
         n = len(text)
         if w_start is not None and w_end is not None and w_end > w_start:
-            # 詞內逐字線性內插:一個詞被切成兩行時(如 "Absorb,吸收." 在語系
-            # 切換處斷開),後半行才有自己的估計起點,而不是跟前半行同一時間。
+            # 詞內逐字線性內插:一個詞被切成兩行時(如多字詞在子句標點處斷開),
+            # 後半行才有自己的估計起點,而不是跟前半行同一時間。
             step = (w_end - w_start) / n
             chars.extend(
                 {"char": ch, "start": w_start + step * k, "end": w_start + step * (k + 1)}

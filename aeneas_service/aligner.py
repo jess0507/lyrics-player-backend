@@ -17,7 +17,7 @@ from lyrics_text import plan_lines, script_units
 
 log = logging.getLogger(__name__)
 
-# 對齊前是否依句末標點 / 語系切換自動切行(使用者原文的分行會因此改變)。
+# 對齊前是否依句末標點 / 子句標點自動切行(使用者原文的分行會因此改變)。
 ALIGN_SPLIT_LINES = os.environ.get("ALIGN_SPLIT_LINES", "1") not in ("0", "false", "False")
 
 

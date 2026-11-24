@@ -195,40 +195,30 @@ class SplitAlignedLinesTest(unittest.TestCase):
         self.assertIn("hello", "".join(new_lines))
         self.assertTrue(any("hello" in l for l in new_lines))
 
-    def test_script_switch_at_line_edge_splits(self):
-        for line, expected in [
-            ("Apple蘋果", ["Apple", "蘋果"]),
-            ("Baby 我想你", ["Baby", "我想你"]),
-            ("我愛你baby", ["我愛你", "baby"]),
-            ("Oh，愛", ["Oh，", "愛"]),  # 標點跟著前段
-            ("520我愛你", ["520我愛你"]),  # 數字是中性
+    def test_script_switch_does_not_split(self):
+        # 對齊模型一次只處理一種語言:語系切換(行首 / 行尾 / 句中的外文)都不是斷點。
+        for line in [
+            "Apple蘋果",
+            "Baby 我想你",
+            "我愛你baby",
+            "520我愛你",
+            "給我一個kiss吧",
+            "我說hello你好嗎",
         ]:
             new_lines, new_chars = _split([line], _timed(line), "", max_chars_cjk=20)
-            self.assertEqual(new_lines, expected, line)
-            self.assertEqual(len(new_chars), len("".join(new_lines)))
+            self.assertEqual(new_lines, [line], line)
+            self.assertEqual(len(new_chars), len(line))
 
-    def test_foreign_word_mid_sentence_not_split(self):
-        for line in ["給我一個kiss吧", "我說hello你好嗎"]:
-            new_lines, _ = _split([line], _timed(line), "", max_chars_cjk=20)
-            self.assertEqual(new_lines, [line])
+    def test_script_switch_in_spaced_language_does_not_split(self):
+        for line in ["I love you 我愛你", "Absorb,吸收."]:
+            new_lines, new_chars = _split([line], _timed(line), " ", max_words=10)
+            self.assertEqual(new_lines, [line], line)
+            self.assertEqual(len(new_chars), len(line))
 
-    def test_script_switch_in_spaced_language(self):
-        line = "I love you 我愛你"
-        new_lines, new_chars = _split([line], _timed(line), " ", max_words=10)
-        self.assertEqual(new_lines, ["I love you", "我愛你"])
-        self.assertEqual(len(new_chars), len(" ".join(new_lines)))
-
-    def test_script_switch_applies_after_sentence_split(self):
+    def test_sentence_split_keeps_mixed_script_together(self):
         line = "好。Apple蘋果"
         new_lines, _ = _split([line], _timed(line), "", max_chars_cjk=20)
-        self.assertEqual(new_lines, ["好。", "Apple", "蘋果"])
-
-    def test_script_switch_inside_spaced_token(self):
-        # 有空格語言裡沒空格隔開的混寫,也在切換處斷開;標點跟著前段。
-        line = "Absorb,吸收."
-        new_lines, new_chars = _split([line], _timed(line), " ", max_words=10)
-        self.assertEqual(new_lines, ["Absorb,", "吸收."])
-        self.assertEqual(len(new_chars), len(" ".join(new_lines)))
+        self.assertEqual(new_lines, ["好。", "Apple蘋果"])
 
     def test_abbreviations_are_not_sentence_ends(self):
         for line in [

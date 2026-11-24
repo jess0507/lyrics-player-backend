@@ -139,23 +139,22 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         lines = _split([{"text": "", "start": 0.0, "end": 2.0, "words": words}], "zh")
         self.assertEqual([l["text"] for l in lines], ["我愛你，", "中國人"])
 
-    def test_script_switch_at_edge_splits(self):
+    def test_script_switch_does_not_split(self):
         words = [_w(c, 0.1 * i, 0.1 * i + 0.05) for i, c in enumerate("Apple蘋果")]
         lines = _split(
             [{"text": "", "start": 0.0, "end": 1.0, "words": words}], "zh", max_chars_cjk=14
         )
-        self.assertEqual([l["text"] for l in lines], ["Apple", "蘋果"])
+        self.assertEqual([l["text"] for l in lines], ["Apple蘋果"])
 
-    def test_word_split_at_script_switch_interpolates_time(self):
-        # 單一詞 "Absorb,吸收."(1.0~2.0s,10 字)在語系切換處斷:後半行起點依字數內插。
+    def test_mixed_script_word_stays_on_one_line(self):
+        # 單一詞 "Absorb,吸收." 不在語系切換處斷:整行沿用該詞的起訖時間。
         words = [_w("Absorb,吸收.", 1.0, 2.0)]
         lines = _split(
             [{"text": "", "start": 1.0, "end": 2.0, "words": words}], "en", max_words=10
         )
-        self.assertEqual([l["text"] for l in lines], ["Absorb,", "吸收."])
+        self.assertEqual([l["text"] for l in lines], ["Absorb,吸收."])
         self.assertAlmostEqual(lines[0]["start"], 1.0)
-        self.assertAlmostEqual(lines[1]["start"], 1.7)
-        self.assertAlmostEqual(lines[1]["end"], 2.0)
+        self.assertAlmostEqual(lines[0]["end"], 2.0)
 
     def test_splits_on_max_duration_at_clause_punct(self):
         words = [_w("a,", 0.0, 2.0), _w("b,", 2.1, 4.0), _w("c", 4.1, 6.0)]
@@ -175,7 +174,7 @@ class SplitSegmentsIntoLinesTest(unittest.TestCase):
         self.assertEqual(lines[0]["end"], 1.5)
 
     def test_leading_digits_in_cjk_backfill_start(self):
-        # 中文段 "520我":數字無時間(也不觸發語系切換)→ 從「我」往回推 3 單元。
+        # 中文段 "520我":數字無時間 → 從「我」往回推 3 單元。
         words = [_w(c) for c in "520"] + [_w("我", 5.0, 5.5)]
         lines = _split(
             [{"text": "", "start": 5.0, "end": 5.5, "words": words}],

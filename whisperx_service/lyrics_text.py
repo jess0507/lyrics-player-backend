@@ -19,7 +19,8 @@
    - 句末標點(。！？. 等)必斷;停頓 ≥ :data:`LINE_LONG_GAP_SECONDS` 必斷(不論長短)。
    - 句子過長才在子句標點(，；：…)或停頓 ≥ :data:`LINE_GAP_SECONDS` 處斷;
      沒有標點也沒有停頓的地方不硬切。
-   - 一段裡語系只切換一次(行首 / 行尾的外文,如 "Apple 蘋果")時在切換處斷。
+   - 不因語系切換(如 "Apple 蘋果")斷行:對齊模型一次只處理一種語言,另一語系的
+     字沒有可靠的時間,切出去的行起點只能用猜的。
 """
 
 from __future__ import annotations
@@ -268,44 +269,6 @@ def _break_kind(line: str, end: int) -> Optional[str]:
     return None
 
 
-def _unit_script(text: str) -> Optional[str]:
-    """單元的語系:``"latin"`` / ``"other"``(漢字、假名、韓文…);數字、標點、
-    遮蔽字元為 None(中性,不算語系切換)。"""
-    for ch in text:
-        if ch.isalpha():
-            return "latin" if "LATIN" in unicodedata.name(ch, "") else "other"
-    return None
-
-
-def _script_cut(text: str, unit_re: "re.Pattern[str]" = None) -> Optional[Tuple[int, int]]:
-    """``text`` 若剛好是「一段拉丁 + 一段非拉丁」(語系只切換一次),回傳
-    ``(第一段結尾, 第二段開頭)`` 的字元位置;否則 None。
-
-    只處理行首 / 行尾的外文(如 "Apple蘋果"、"Baby 我想你"、"我愛你baby");
-    句中夾外文("給我一個kiss吧" 切換兩次)不動。中性單元(數字、標點)跟著前段。
-
-    一律以字元級單元(拉丁英數串 / 單一其他字元)判斷,不用呼叫端的分詞:有空格
-    語言裡沒空格隔開的混寫("Absorb,吸收.")也能在切換處斷開。``unit_re`` 參數
-    僅為相容保留,不使用。
-    """
-    unit_re = _CJK_UNIT_RE
-    runs = 0
-    prev_script: Optional[str] = None
-    last_end = 0
-    cut: Optional[Tuple[int, int]] = None
-    for m in unit_re.finditer(text):
-        script = _unit_script(m.group())
-        if script is not None and script != prev_script:
-            runs += 1
-            if runs == 2:
-                cut = (last_end, m.start())
-            elif runs > 2:
-                return None
-            prev_script = script
-        last_end = m.end()
-    return cut
-
-
 def split_aligned_lines(
     lines: List[str],
     chars: List[dict],
@@ -316,7 +279,7 @@ def split_aligned_lines(
     gap_seconds: float = LINE_GAP_SECONDS,
     long_gap_seconds: float = LINE_LONG_GAP_SECONDS,
 ) -> Tuple[List[str], List[dict]]:
-    """依標點 / 停頓 / 語系把行切短(純函式,可單元測試)。
+    """依標點 / 停頓把行切短(純函式,可單元測試)。
 
     ``chars`` 須與 ``separator.join(lines)`` 逐字對應(長度不符則原樣回傳);
     停頓 = 下一單元首字 start − 前一個有時間的字 end(無時間的字不算)。
@@ -327,9 +290,8 @@ def split_aligned_lines(
        **子句標點**(，；：… 等)或停頓 ≥ ``gap_seconds`` 處斷,且以片段為單位
        貪婪合併:放得下就併在同一行,避免切成一堆碎行。沒有這類斷點就保留長行,
        不在詞中間硬切。
-    4. 斷完的每段若是「一段拉丁 + 一段非拉丁」(語系只切換一次,如
-       "Apple蘋果"),在切換處斷開;句中夾外文不斷(見 :func:`_script_cut`)。
-    5. 標點跟著前一段,不會成為新行開頭。
+    4. 標點跟著前一段,不會成為新行開頭。
+    5. 語系切換(拉丁 ↔ 其他文字,如 "Apple蘋果")不是斷點。
 
     回傳 ``(new_lines, new_chars)``,同樣滿足
     ``len(new_chars) == len(separator.join(new_lines))``,可直接交給
@@ -432,17 +394,11 @@ def split_aligned_lines(
             if group:
                 groups.append(group)
 
-        if len(groups) == 1 and _script_cut(line, unit_re) is None:
+        if len(groups) == 1:
             emit(line, line_chars)  # 不切:原樣保留(含行首尾空白)
             continue
         for group in groups:
             s, e = group[0][0], group[-1][1]
-            cut = _script_cut(line[s:e], unit_re)
-            if cut is None:
-                emit(line[s:e], line_chars[s:e])
-            else:
-                a, b = s + cut[0], s + cut[1]
-                emit(line[s:a], line_chars[s:a])
-                emit(line[b:e], line_chars[b:e])
+            emit(line[s:e], line_chars[s:e])
 
     return new_lines, new_chars

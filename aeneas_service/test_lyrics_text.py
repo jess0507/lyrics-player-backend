@@ -146,21 +146,15 @@ class LongLineSplitTest(unittest.TestCase):
 
 
 class ScriptSplitTest(unittest.TestCase):
-    def test_single_switch_split(self):
-        self.assertEqual(texts("Apple蘋果"), ["Apple", "蘋果"])
-        self.assertEqual(texts("Absorb,吸收."), ["Absorb,", "吸收."])
-        self.assertEqual(texts("我愛你baby"), ["我愛你", "baby"])
+    def test_script_switch_does_not_split(self):
+        # aeneas 一次只用一種語言合成:語系切換不是斷點。
+        for line in ["Apple蘋果", "Absorb,吸收.", "我愛你baby", "給我一個kiss吧", "2024我們"]:
+            self.assertEqual(texts(line), [line], line)
 
-    def test_embedded_foreign_word_not_split(self):
-        self.assertEqual(texts("給我一個kiss吧"), ["給我一個kiss吧"])
-
-    def test_numbers_are_neutral(self):
-        self.assertEqual(texts("2024我們"), ["2024我們"])
-
-    def test_leading_section_tag_stays_with_first_part(self):
+    def test_leading_section_tag_line_stays_whole(self):
         rows, align_texts = plan_lines(["[Chorus] Baby 我想你"])
-        self.assertEqual([r["text"] for r in rows], ["[Chorus] Baby", "我想你"])
-        self.assertEqual(align_texts, ["Baby", "我想你"])
+        self.assertEqual([r["text"] for r in rows], ["[Chorus] Baby 我想你"])
+        self.assertEqual(align_texts, ["Baby 我想你"])
 
 
 class ScriptUnitsTest(unittest.TestCase):
