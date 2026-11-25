@@ -119,10 +119,11 @@ class SplitAlignedLinesTest(unittest.TestCase):
         self.assertEqual(len(new_chars), len("".join(new_lines)))
 
     def test_long_line_clauses_greedily_merged(self):
-        # 上限 4 字:「一，二，」可併成一行,不會切成四行碎片。
+        # 上限 4 字(標點不計):「一，二，三四，」剛好 4 字併成一行,
+        # 放不下的「五」才另起一行,不會切成四行碎片。
         line = "一，二，三四，五"
         new_lines, _ = _split([line], _timed(line), "")
-        self.assertEqual(new_lines, ["一，二，", "三四，五"])
+        self.assertEqual(new_lines, ["一，二，三四，", "五"])
 
     def test_long_line_without_punct_not_split(self):
         line = "一二三四五六"
