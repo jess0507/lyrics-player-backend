@@ -7,9 +7,33 @@ service cloud.firestore {
     match /user/{uid} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
 
-      // 子集合（若日後 tracks 改為 subcollection）一併限定本人。
-      match /{document=**} {
-        allow read, write: if request.auth != null && request.auth.uid == uid;
+      // 後端對時 / 產生任務的投遞點（含 status 與歌詞結果）：本人唯讀,
+      // 只由後端以 Admin SDK 寫入。
+      match /lyrics/{jobId} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+      }
+
+      // 其餘子集合（setting / playlist / monthlyStats / backupLyrics…）限定本人讀寫。
+      // 規則是任一條允許就放行,所以這裡必須排除 lyrics,上面的唯讀才有效。
+      match /{collection}/{document=**} {
+        allow read, write: if request.auth != null
+          && request.auth.uid == uid
+          && collection != 'lyrics';
+      }
+    }
+
+    // 全域 App 設定（例如 freeUserMonthlyMinutes）：登入者唯讀。
+    match /setting/appConfig {
+      allow read: if request.auth != null;
+    }
+
+    // 歌詞辨識 / 對時用量：本人唯讀,由後端記帳。
+    // usage/{uid} 為舊版單一文件,usage/{uid}/months/{YYYY-MM} 為現行每月文件。
+    match /usage/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+
+      match /months/{month} {
+        allow read: if request.auth != null && request.auth.uid == uid;
       }
     }
   }
