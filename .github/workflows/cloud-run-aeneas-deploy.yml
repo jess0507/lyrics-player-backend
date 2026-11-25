@@ -10,6 +10,7 @@ name: Deploy aeneas align (Cloud Run)
 # 只有 push 版本 tag(如 1.0.1)才觸發;push 到 master 不再部署。
 # tag push 時 GitHub 不套用 paths 篩選,改由下方 Detect changes 比對「上一個 tag → 本 tag」
 # 是否動到 aeneas_service/,沒動到就跳過部署。找不到上一個 tag 或手動觸發 → 一律部署。
+# 只改測試檔(aeneas_service/test_*.py)不算變更:測試不進容器的執行路徑,不需要重建。
 on:
   push:
     tags:
@@ -38,8 +39,8 @@ jobs:
           if [ -z "$prev" ]; then
             echo "無上一個 tag 可比對(event=$EVENT_NAME),部署"
             echo "deploy=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$prev" "$GITHUB_SHA" -- aeneas_service/; then
-            echo "$prev → $GITHUB_REF_NAME 未變更 aeneas_service/,略過部署"
+          elif git diff --quiet "$prev" "$GITHUB_SHA" -- aeneas_service/ ':(exclude)aeneas_service/test_*.py'; then
+            echo "$prev → $GITHUB_REF_NAME 未變更 aeneas_service/(測試檔不算),略過部署"
             echo "deploy=false" >> "$GITHUB_OUTPUT"
           else
             echo "$prev → $GITHUB_REF_NAME 變更了 aeneas_service/,部署"

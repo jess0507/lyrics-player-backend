@@ -6,6 +6,7 @@ name: Deploy Cloud Functions
 # - firestore.rules    → firestore:rules
 # - storage.rules      → storage
 # - firebase.json、.firebaserc → 全部（設定影響所有目標）
+# 只改測試檔(test_*.py)不算變更,不會觸發部署。
 # 只改本 workflow 檔不會觸發部署；要驗證 workflow 請手動觸發
 # （Actions 頁 → Deploy Cloud Functions → Run workflow），手動觸發一律部署全部。
 # 規則只維護在本 repo（App repo seek_player 已移除副本），避免兩邊互相覆蓋。
@@ -44,7 +45,8 @@ jobs:
             all=true
             echo "無上一個 tag 可比對（event=$EVENT_NAME），部署全部"
           else
-            changed=$(git diff --name-only "$prev" "$AFTER")
+            # 測試檔(test_*.py)不算變更:只改測試不需要部署。
+            changed=$(git diff --name-only "$prev" "$AFTER" | grep -vE '(^|/)test_[^/]*\.py$' || true)
             echo "$prev → $GITHUB_REF_NAME 變更的檔案："
             echo "$changed"
           fi
