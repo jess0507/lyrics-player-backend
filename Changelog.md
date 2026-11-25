@@ -1,9 +1,16 @@
 # Changelog
 
 ## develop
+
+## 1.0.5(20261125)
+- rules:開放 App 讀取歌詞用量檢查所需的文件,修正事前額度檢查一律 `permission-denied`
+  - `setting/appConfig`:登入者唯讀
+  - `usage/{uid}`、`usage/{uid}/months/{YYYY-MM}`:本人唯讀
+- rules:`user/{uid}/lyrics/{jobId}` 改為本人唯讀,任務狀態與歌詞結果只由後端寫入
 - ci:部署前先跑完全部單元測試,失敗就不部署
   - 三個部署 workflow 共用 `.github/actions/run-tests`,不論部署哪個服務都跑 whisperx、aeneas 全部測試
   - 該次 tag 沒有要部署的目標時不跑
+- ci:只改測試檔(`test_*.py`)不算變更,不觸發部署
 - whisperx:補上 `/transcribe` 整條流程的文字保留回歸測試(中 / 日文夾英文不黏字)
 
 ## 1.0.4(2026112402)
